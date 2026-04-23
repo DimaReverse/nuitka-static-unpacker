@@ -99,18 +99,18 @@ If this project helps you, or if you build something on top of it, that means mo
 
 ## Features
 
-| Feature | Open-source builds | Commercial builds |
-|---|---|---|
-| Python version detection (PE imports) | ✅ | ✅ |
-| Constants blob extraction | ✅ | ✅ (decrypted) |
-| Module table parsing | ✅ | ✅ |
-| Commercial encryption bypass | — | ✅ |
-| `.pyc` extraction | ✅ | ✅ |
-| Code object map (functions, args, line numbers) | ✅ | ✅ |
-| Secrets scanner (passwords, keys, URLs) | ✅ | ✅ |
-| Multi-backend decompilation pipeline | ✅ | ✅ |
-| JSON report | ✅ | ✅ |
-| Dynamic DLL injection mode | Windows | Windows |
+- **Single-file tool**: everything lives in `nuitka_decompiler.py` (no package install required beyond Python deps).
+- **Static-first analysis**: PE parsing, Python version detection, constants/blob discovery and decoding.
+- **Commercial `data-hiding` support (static)**: includes a research implementation that can attempt to recover key material from the binary and decrypt the constants blob (when present), then parse it normally.
+- **Module table parsing**: recovers module list/metadata from PE sections when available.
+- **`.pyc` extraction**: recovers bytecode and writes per-module artifacts.
+- **Code object map**: function signatures / args / line metadata (where recoverable).
+- **Secrets scanner**: finds likely passwords/keys/URLs in extracted constants.
+- **Multi-backend decompilation**: tries multiple decompilers and falls back gracefully.
+- **JSON report**: writes a global `REPORT.json` plus per-module outputs.
+- **Optional dynamic mode (Windows)**: DLL injection workflow to capture live sources.
+
+**Compatibility note:** this has **not been tested yet on Nuitka v4 binaries** — format/layout changes may require updates.
 
 ### How the Commercial bypass works
 
