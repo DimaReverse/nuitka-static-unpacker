@@ -66,6 +66,8 @@ At the time, I was dealing with severe isolation and a constant feeling of being
 
 I was pushed into programs designed for people with significantly different needs than mine, placed in environments where I didn’t belong, and repeatedly told — directly and indirectly — that I wouldn’t be able to work, live independently, or even get a driver’s license.
 
+On top of that, I had to deal with ongoing medical and administrative processes (including support/guardianship-style arrangements) that left me feeling like pieces of my autonomy were being taken away day by day — through pressure, conditional “help”, and situations where saying “no” didn’t feel like a real option.
+
 At school, things weren’t better. I experienced heavy and persistent bullying, to the point where attending classes became extremely difficult. Over time, I stopped going regularly and was no longer able to complete my final year in the standard way.
 
 Outside of school, my social life almost disappeared. I lost most of my friends and spent long periods of time alone. Many nights were spent online, playing games with older people simply because they treated me with more respect than people my own age.
@@ -294,6 +296,16 @@ If you find a security-sensitive issue, please report it privately first. See [`
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+---
+
+## Donations
+
+If you want to support the project:
+
+- **BTC**: `bc1qa36fz0726e858l6enj7pt3359j20z98npl3av0`
+- **LTC**: `ltc1qpszucslm3zyq2caemrrxr6dxx7kh28nx7xrgpc`
+- **ETH**: `0x8541027655a7DfC7150F9bc9E603300048AeE022`
 
 ---
 
