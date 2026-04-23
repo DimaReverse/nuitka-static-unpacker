@@ -293,6 +293,13 @@ If you find a security-sensitive issue, please report it privately first. See [`
 
 ---
 
+## Acknowledgements
+
+- Thanks to **OMΣGΛΛΛ** for sharing reference materials and guidance that helped me understand Nuitka Commercial internals for research and analysis.
+- Thanks to **[@Siradankullanici](https://github.com/Siradankullanici)** for helping me a lot during the last period to finalize this project.
+
+---
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
