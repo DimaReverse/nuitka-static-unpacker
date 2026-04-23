@@ -42,6 +42,20 @@ It can also optionally switch to a **dynamic mode** via DLL injection to capture
 
 ## Quick start
 
+### Important (onefile targets)
+
+If your target is a **Nuitka onefile** executable, you often need to **extract the embedded files first** (embedded `.exe` / `.pyd` / `.dll` payloads).  
+Use [Extreme Coder’s `nuitka-extractor`](https://github.com/extremecoders-re/nuitka-extractor) to unpack the onefile, then run this tool on the extracted binary.
+
+If you skip this step, you may hit:
+
+```text
+PHASE 2: CONSTANTS BLOB EXTRACTION ||
+=================================================================
+[!!] Blob not found in RT_RCDATA, searching for static embedding...
+[!!] Constants blob not found!
+```
+
 ```bash
 pip install -r requirements.txt
 python nuitka_decompiler.py --source target.exe
