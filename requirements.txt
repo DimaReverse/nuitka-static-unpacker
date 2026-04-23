@@ -1,0 +1,20 @@
+# Core dependency — required
+pefile>=2023.2.7
+
+# Enhanced disassembly (optional but recommended)
+capstone>=5.0.1
+
+# Cross-version .pyc support (optional)
+xdis>=6.1.1
+
+# Decompiler backends — install any or all for best results
+uncompyle6>=3.9.2
+decompyle3>=3.9.2
+decompile3>=3.9.2
+
+# pylingual backend (optional — uses remote API)
+# pylingual>=0.1.0
+
+# External CLI decompilers (pycdc / pycdas):
+# Build from source: https://github.com/zrax/pycdc
+# Or grab a prebuilt release and put it on your PATH.
