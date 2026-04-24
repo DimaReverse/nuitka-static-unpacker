@@ -1,37 +1,62 @@
 # Contributing
 
-Thanks for taking the time to look at this project.
+Thanks for taking the time to improve this project.
 
-## What's most useful right now
+This repository is for legitimate analysis of Nuitka-compiled software. Before
+opening an issue or pull request, please read [ETHICS.md](ETHICS.md).
 
-- **Bug reports** with reproduction steps (target Nuitka version, Python version, error output)
-- **New Nuitka version support** — the blob format shifts between releases; PRs with format notes are very welcome
-- **Decompiler backend improvements** — better fallback logic, new backends, coverage for edge cases
-- **Test fixtures** — sanitized or synthetic binaries that exercise specific code paths
-- **Documentation** — clearer architecture notes, usage examples, explanations of the blob format
+## Useful Contributions
 
-## Before opening a PR
+- Bug reports with reproducible steps and sanitized logs
+- Support for new Nuitka versions using synthetic or open-source fixtures
+- Parser correctness improvements
+- Safer error handling and clearer diagnostics
+- Documentation that helps authorized analysts avoid misuse
+- Tests built from small fixtures generated specifically for this repo
 
-1. Describe the problem you're solving or the feature you're adding
-2. Keep changes focused — one thing per PR makes review much faster
-3. If you're changing parsing logic, explain which Nuitka version or format variant it targets
+## Contribution Rules
 
-## Reporting bugs
+- Do not upload proprietary binaries, recovered source, credentials, customer
+  data, private keys, tokens, or malware payloads.
+- Do not submit changes whose primary purpose is license circumvention, DRM
+  bypass, unauthorized source recovery, or evasion.
+- Keep pull requests focused. One behavioral change per PR is easiest to review.
+- If a parsing change targets a specific Nuitka version, document the version,
+  platform, Python version, and build flags when possible.
+- Prefer synthetic fixtures over real-world samples.
+
+## Reporting Bugs
 
 Please include:
 
 - Operating system and Python version
-- Nuitka version of the target binary (if known)
-- Whether the target is open-source or commercial build
-- Full command you ran
-- Full console output or traceback
+- Nuitka version and Python version used to build the test target, if known
+- Whether the sample is synthetic, open-source, owned by you, or covered by an
+  engagement authorization
+- Full command line
+- Redacted console output or traceback
+- Expected behavior and actual behavior
 
-## Code style
+Do not attach binaries or extracted files unless they are clearly redistributable
+and safe to share.
+
+## Pull Request Checklist
+
+- The change has a legitimate research, defensive, interoperability, testing, or
+  documentation purpose.
+- No unauthorized third-party files are included.
+- Sensitive output has been redacted from examples and tests.
+- New fixtures are synthetic, minimal, and documented.
+- User-facing text does not encourage misuse.
+
+## Code Style
 
 - PEP 8 where reasonable
-- Descriptive variable names in parsing code — magic numbers need comments
-- No external dependencies added without discussion
+- Descriptive variable names in parsing code
+- Comments for non-obvious format assumptions or magic constants
+- No new external dependencies unless they are necessary and documented
 
-## Discussions
+## Security-Sensitive Issues
 
-Open an issue for anything you're unsure about. Questions are welcome.
+If you found a vulnerability in this repository itself, report it privately.
+See [SECURITY.md](SECURITY.md).

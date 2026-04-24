@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-list_modules.py — List all modules inside a Nuitka-compiled binary in 1-2 seconds.
+list_modules.py - List modules inside an authorized Nuitka-compiled binary.
 
 Does ONLY:
   1. PE analysis (Python version, edition)
   2. Blob extraction
-  3. Commercial bypass (name decoding only — no full decryption needed)
+  3. Protected module-name normalization when present
   4. Module name parsing from blob headers
 
 Does NOT:
-  - Decompile anything
+  - Reconstruct or decompile application source
   - Extract .pyc files
   - Run the disassembler
   - Write any output files
 
 Usage:
-    python list_modules.py target.exe
-    python list_modules.py target.exe --json
-    python list_modules.py target.exe --filter crypto
-    python list_modules.py target.exe --filter crypto --copy-cmd
+    python list_modules.py authorized_app.exe
+    python list_modules.py authorized_app.exe --json
+    python list_modules.py authorized_app.exe --filter mypackage
+    python list_modules.py authorized_app.exe --filter mypackage --copy-cmd
 """
 
 from __future__ import annotations
@@ -44,10 +44,10 @@ except ImportError:
     HAS_PEFILE = False
 
 
-# ── Commercial module-name decoding ─────────────────────────────────────────
+# ---- Protected module-name decoding ----------------------------------------
 
 def _build_mapping2() -> list[int]:
-    """Reconstruct the module-name obfuscation table (seed=27, always constant)."""
+    """Build a module-name decoding table for supported protected layouts."""
     r = Random(27)
     fwd = list(range(1, 256))
     r.shuffle(fwd)
@@ -59,7 +59,7 @@ _MAPPING2 = _build_mapping2()
 
 
 def decode_module_name(raw: bytes) -> str:
-    """Decode a commercial-build module name obfuscated with mapping2."""
+    """Decode a module name from a supported protected layout."""
     return bytes(_MAPPING2[b] for b in raw).decode("utf-8", errors="replace")
 
 
@@ -228,7 +228,7 @@ def list_modules(target: str,
         return 0
 
     total = len(modules)
-    enc_label = "commercial (encrypted)" if is_enc else "open-source"
+    enc_label = "protected metadata" if is_enc else "plain metadata"
     print(f"\n  Target  : {os.path.basename(target)}")
     print(f"  Blob    : {source}")
     print(f"  Edition : {enc_label}")
@@ -262,9 +262,9 @@ def list_modules(target: str,
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="list_modules",
-        description="List all modules inside a Nuitka-compiled binary. Fast — no decompilation.",
+        description="List modules inside an authorized Nuitka binary. Fast; no source reconstruction.",
     )
-    ap.add_argument("target", help="Nuitka-compiled .exe or .dll")
+    ap.add_argument("target", help="Authorized Nuitka-compiled .exe or .dll")
     ap.add_argument("--json", action="store_true",
                     help="Output as JSON (for scripting)")
     ap.add_argument("--filter", metavar="STR", default=None,

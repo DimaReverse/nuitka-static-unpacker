@@ -2,6 +2,9 @@
 
 This document describes what the tool knows about the Nuitka constants blob format, based on reverse engineering and cross-referencing with the open-source Nuitka codebase.
 
+These notes are for authorized research, interoperability work, and synthetic
+test fixtures. They are not permission to inspect third-party software.
+
 ---
 
 ## Open-source blob layout
@@ -98,4 +101,4 @@ The blob format has shifted across Nuitka versions. Known divergence points:
 - Nuitka 1.x–2.x: current format described above
 - The `_mapping2` seed (27) has been stable across all versions tested
 
-If you encounter a blob the tool fails to parse, open an issue with the Nuitka version and the hex of the first 64 bytes of the blob.
+If you encounter a blob the tool fails to parse, open an issue with the Nuitka version and sanitized error output. Do not post proprietary bytes, recovered source, credentials, or private customer data publicly.

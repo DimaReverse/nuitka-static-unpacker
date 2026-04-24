@@ -1,5 +1,8 @@
 # Usage
 
+Use this tool only on binaries you own, are authorized to inspect, or are
+handling for legitimate defensive research.
+
 ## Prerequisites
 
 - Python 3.8+
@@ -9,7 +12,7 @@
 ## Basic usage
 
 ```bash
-python nuitka_decompiler.py --source target.exe
+python nuitka_decompiler.py --source authorized_target.exe
 ```
 
 Output goes to `./output/` by default.
@@ -18,14 +21,14 @@ Output goes to `./output/` by default.
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--source PATH` | `-s` | Target `.exe` or `.dll` (required) |
+| `--source PATH` | `-s` | Authorized target `.exe` or `.dll` (required) |
 | `--output DIR` | `-o` | Output directory (default: `./output`) |
 | `--all` | `-a` | Include stdlib/library modules (default: main module only) |
 | `--only MODULES` | | Comma-separated list of module names or `pkg.*` glob patterns to restrict recursive disassembly to |
 | `--no-banner` | | Suppress the ASCII banner |
-| `--inject` | | Enable dynamic DLL injection after static analysis |
+| `--inject` | | Enable dynamic DLL injection after static analysis (authorized lab use only) |
 | `--launch` | | Launch the target EXE before injecting |
-| `--pid PID` | | Inject into a specific running PID |
+| `--pid PID` | | Inject into a specific authorized running PID |
 | `--dll PATH` | | Path to custom hook DLL (default: `hook64.dll` in script dir) |
 | `--hook-script PATH` | | Path to hook Python script |
 | `--dump-timeout N` | | Seconds to wait for dynamic dump (default: 60) |
@@ -35,25 +38,25 @@ Output goes to `./output/` by default.
 ### Analyze a target, include all modules, custom output dir
 
 ```bash
-python nuitka_decompiler.py -s crackme.exe -a -o ./crackme_out
+python nuitka_decompiler.py -s authorized_target.exe -a -o ./analysis_out
 ```
 
 ### Restrict to one package and its submodules
 
 ```bash
-python nuitka_decompiler.py -s app.exe --only myapp,myapp.*
+python nuitka_decompiler.py -s authorized_target.exe --only myapp,myapp.*
 ```
 
 ### Static analysis + dynamic injection in one pass
 
 ```bash
-python nuitka_decompiler.py -s app.exe -a --inject --launch
+python nuitka_decompiler.py -s authorized_target.exe -a --inject --launch
 ```
 
 ### Inject into already-running process
 
 ```bash
-python nuitka_decompiler.py -s app.exe --inject --pid 5432
+python nuitka_decompiler.py -s authorized_target.exe --inject --pid 5432
 ```
 
 ## Understanding the output
@@ -101,7 +104,7 @@ output/
 
 **`Blob not found`** — the tool scans PE resources and embedded sections. Some unusual Nuitka builds embed the blob differently. Open an issue with the Nuitka version.
 
-**`CRC mismatch after all bypass attempts`** — could be an unsupported commercial encryption variant. Please share the hex dump of the first 64 bytes of the blob if you can.
+**`CRC mismatch after all bypass attempts`** — could be an unsupported commercial encryption variant. Open an issue with the Nuitka version and sanitized error output; do not post proprietary bytes, secrets, or private samples publicly.
 
 **Decompiler backends all fail** — the raw `.pyc` is still extracted. You can try decompiling it manually with any compatible tool.
 

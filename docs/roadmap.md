@@ -5,7 +5,7 @@ This is a rough plan — not a promise. Priority shifts based on what people act
 ## Near term
 
 - [ ] Split monolithic script into proper Python package structure (see `docs/architecture.md`)
-- [ ] Add unit tests for blob parsing and commercial bypass
+- [ ] Add unit tests for blob parsing and commercial data-hiding handling
 - [ ] Add synthetic test fixtures (no real proprietary binaries)
 - [ ] Improve CLI output formatting and progress reporting
 - [ ] Publish first tagged release (`v7.2.0`)

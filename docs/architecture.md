@@ -2,6 +2,9 @@
 
 The entire tool is implemented in `nuitka_decompiler.py` (~10,000 lines). This document maps out the major components and how data flows through them.
 
+This architecture is documented for authorized analysis, defensive research,
+interoperability work, and safe test fixtures.
+
 ---
 
 ## Extraction pipeline (static mode)
@@ -54,6 +57,9 @@ target.exe / target.dll
 ### `CommercialBypass`
 
 Handles detection and decryption of Nuitka Commercial's `data-hiding` plugin output.
+
+Use this capability only for binaries you own or are explicitly authorized to
+inspect.
 
 **Detection**: checks whether `CRC32(payload) == stored_crc`. Mismatch → encrypted.
 

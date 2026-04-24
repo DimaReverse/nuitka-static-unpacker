@@ -8,14 +8,14 @@
 |_| \_|\__,_|_|\__|_|\_\__,_|_|_/___\__,_|\__\___/|_|   
 ```
 
-**Nuitka Static Unpacker · Nuitka Commercial "data-hiding" research · Pure Python**
+**Nuitka Static Unpacker · Authorized Nuitka binary analysis · Pure Python**
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Lines](https://img.shields.io/badge/lines%20of%20code-10%2C000%2B-orange?style=flat-square)](nuitka_decompiler.py)
 [![Status](https://img.shields.io/badge/status-active%20research-brightgreen?style=flat-square)]()
 
-*Analyze Nuitka-compiled Python binaries and extract the embedded constants/modules/bytecode — with a single script.*
+*Analyze authorized Nuitka-compiled Python binaries and extract constants, module metadata, and bytecode artifacts — with a single script.*
 
 </div>
 
@@ -23,9 +23,23 @@
 
 ## What is this?
 
-**Nuitka Static Unpacker** is a *static-first* analysis tool for Python binaries compiled with [Nuitka](https://nuitka.net/). It extracts constants, module structures, code object metadata, and `.pyc` files from **open-source** Nuitka builds — and includes a research-grade implementation that can *attempt* to decrypt the constants blob used by Nuitka Commercial's `data-hiding` plugin (when present).
+**Nuitka Static Unpacker** is a *static-first* analysis tool for Python binaries compiled with [Nuitka](https://nuitka.net/). It extracts constants, module structures, code object metadata, and `.pyc` artifacts from Nuitka builds you own or are authorized to inspect — and includes research-grade handling for Nuitka Commercial `data-hiding` metadata when present.
 
-It can also optionally switch to a **dynamic mode** via DLL injection to capture live Python source at runtime.
+It can also optionally switch to a **dynamic mode** via DLL injection for controlled lab analysis of processes you are allowed to instrument.
+
+This project is independent and is not affiliated with, endorsed by, or maintained by the Nuitka project.
+
+---
+
+## Responsible use
+
+This repository is published for legitimate reverse engineering, interoperability research, malware analysis, defensive security work, and education.
+
+Use it only on software you own, software you have explicit permission to analyze, malware/suspicious samples handled for defensive purposes, or CTF/lab targets where reverse engineering is expected.
+
+Do **not** use it to bypass licenses, defeat DRM/access controls, recover proprietary source without permission, extract secrets for unauthorized access, or violate software licenses, contracts, platform terms, or local law. This is not legal advice; if a target is not clearly authorized, do not analyze it.
+
+See [`ETHICS.md`](ETHICS.md) for the detailed responsible-use policy.
 
 ---
 
@@ -33,7 +47,7 @@ It can also optionally switch to a **dynamic mode** via DLL injection to capture
 
 - **Malware analysis / DFIR**: extract embedded `.pyc`, strings/constants, and module structure from suspicious Nuitka-packed samples.
 - **Authorized security audits**: quickly inventory hardcoded secrets, URLs, tokens, and configuration shipped inside compiled binaries.
-- **CTFs / crackmes**: recover bytecode and high-level structure for reversing challenges compiled with Nuitka.
+- **CTFs / training challenges**: recover bytecode and high-level structure for reversing challenges compiled with Nuitka.
 - **Interoperability research**: understand how a Nuitka binary maps back to Python packages/modules and code objects.
 - **Regression / build verification**: compare extracted constants/modules across builds to detect unexpected changes.
 - **Triage before deeper reversing**: get a fast static report (`REPORT.json`, constants dumps) before opening IDA/Ghidra.
@@ -53,12 +67,12 @@ Analysis mode is identical regardless of file type — just pass `--source targe
 
 ### Important (onefile targets)
 
-If your target is a **Nuitka onefile** executable, you need to **extract the embedded payload first** before running this tool. Two options depending on the outer protection layer:
+If your authorized target is a **Nuitka onefile** executable, analyze the inner Nuitka payload rather than the outer launcher. Depending on the wrapper, you may need to extract the embedded payload first:
 
 | Outer protection | Extraction tool |
 |---|---|
 | Plain Nuitka onefile (no packer) | [nuitka-extractor](https://github.com/extremecoders-re/nuitka-extractor) |
-| **Themida / WinLicense** + Nuitka onefile | [nuitka-themida-unpacker](https://github.com/DimaReverse/nuitka-themida-unpacker) ← companion repo |
+| **Themida / WinLicense** + Nuitka onefile | [nuitka-themida-unpacker](https://github.com/DimaReverse/nuitka-themida-unpacker) ← companion repo, for owned/authorized targets only |
 
 If you skip this step, you may hit:
 
@@ -71,7 +85,7 @@ PHASE 2: CONSTANTS BLOB EXTRACTION ||
 
 ```bash
 pip install -r requirements.txt
-python nuitka_decompiler.py --source target.exe
+python nuitka_decompiler.py --source authorized_target.exe
 ```
 
 More examples and the full flag reference: [`docs/usage.md`](docs/usage.md).
@@ -102,8 +116,8 @@ OUT/
 Recommended focused workflow:
 
 ```bash
-python nuitka_decompiler.py --source target.exe --list-modules --filter myapp
-python nuitka_decompiler.py --source target.exe --output OUT --only myapp,myapp.* --no-pyc-decompile
+python nuitka_decompiler.py --source authorized_target.exe --list-modules --filter myapp
+python nuitka_decompiler.py --source authorized_target.exe --output OUT --only myapp,myapp.* --no-pyc-decompile
 ```
 
 `--no-pyc-decompile` skips the classic `.pyc -> .py` backend phase and keeps the
@@ -162,24 +176,24 @@ Instead of waiting for the full pipeline to process every module, you can now in
 
 ```bash
 # Step 1 — list all modules in ~1 second
-python list_modules.py target.exe
+python list_modules.py authorized_target.exe
 
 # Step 2 — filter by name
-python list_modules.py target.exe --filter crypto
+python list_modules.py authorized_target.exe --filter myapp
 
 # Step 3 — get a ready-to-paste command
-python list_modules.py target.exe --filter crypto --copy-cmd
-# Output:  python nuitka_decompiler.py --source target.exe --only crypto,crypto.utils
+python list_modules.py authorized_target.exe --filter myapp --copy-cmd
+# Output:  python nuitka_decompiler.py --source authorized_target.exe --only myapp,myapp.utils
 
 # Step 4 — decompile only those modules, skip everything else
-python nuitka_decompiler.py --source target.exe --only crypto,crypto.utils
+python nuitka_decompiler.py --source authorized_target.exe --only myapp,myapp.utils
 ```
 
 Or without the separate script, directly inside the main tool:
 
 ```bash
-python nuitka_decompiler.py --source target.exe --list-modules
-python nuitka_decompiler.py --source target.exe --list-modules --filter config
+python nuitka_decompiler.py --source authorized_target.exe --list-modules
+python nuitka_decompiler.py --source authorized_target.exe --list-modules --filter config
 ```
 
 ---
@@ -237,7 +251,7 @@ If this project helps you, or if you build something on top of it, that means mo
 
 - **Single-file tool**: everything lives in `nuitka_decompiler.py` (no package install required beyond Python deps).
 - **Static-first analysis**: PE parsing, Python version detection, constants/blob discovery and decoding.
-- **Commercial `data-hiding` support (static)**: includes a research implementation that can attempt to recover key material from the binary and decrypt the constants blob (when present), then parse it normally.
+- **Commercial `data-hiding` metadata support (static)**: includes a research implementation that can normalize supported protected constants metadata for authorized analysis.
 - **Module table parsing**: recovers module list/metadata from PE sections when available.
 - **Fast module listing**: `list_modules.py` / `--list-modules` — see all module names in ~1 second without running the full pipeline.
 - **`.pyc` extraction**: recovers bytecode and writes per-module artifacts.
@@ -246,18 +260,18 @@ If this project helps you, or if you build something on top of it, that means mo
 - **Secrets scanner**: finds likely passwords/keys/URLs in extracted constants.
 - **Multi-backend decompilation**: tries multiple decompilers and falls back gracefully.
 - **JSON report**: writes a global `REPORT.json` plus per-module outputs.
-- **Optional dynamic mode (Windows)**: DLL injection workflow to capture live sources.
+- **Optional dynamic mode (Windows)**: DLL injection workflow for controlled lab analysis of owned/authorized processes.
 
 **Compatibility note:** this has **not been tested yet on Nuitka v4 binaries** — format/layout changes may require updates.
 
-### How the Commercial bypass works
+### Research note: Commercial `data-hiding` handling
 
 Nuitka Commercial's `data-hiding` plugin encrypts the constants blob using:
 - A **substitution cipher** with a 256-byte `_mapping[]` table hardcoded in the binary
 - **XOR** with a running counter + MD5 digest feedback (`d0`–`d7`, also hardcoded)
 - Module names obfuscated with a second mapping seeded with `Random(27)` — always reconstructible without the binary
 
-The tool locates both tables in the PE's `.text`/`.rdata` sections, tries all valid combinations with CRC32 validation, and decrypts the blob before parsing. Module names are always recoverable independently.
+For authorized targets, the tool locates the relevant metadata in the PE's `.text`/`.rdata` sections, validates candidates with CRC32, and normalizes the blob before parsing.
 
 ---
 
@@ -265,7 +279,7 @@ The tool locates both tables in the PE's `.text`/`.rdata` sections, tries all va
 
 | Repo | What it does |
 |---|---|
-| [nuitka-themida-unpacker](https://github.com/DimaReverse/nuitka-themida-unpacker) | Full pipeline for targets protected with **Themida/WinLicense + Nuitka onefile**: strips the packer layer, extracts the embedded payload, feeds it here |
+| [nuitka-themida-unpacker](https://github.com/DimaReverse/nuitka-themida-unpacker) | Pipeline for owned/authorized targets protected with **Themida/WinLicense + Nuitka onefile**: extracts the embedded payload and feeds it here |
 | [nuitka-extractor](https://github.com/extremecoders-re/nuitka-extractor) | Unpacks plain Nuitka onefile executables (no Themida) |
 
 ---
@@ -305,43 +319,43 @@ pip install uncompyle6 decompyle3 decompile3
 ### Basic static analysis
 
 ```bash
-python nuitka_decompiler.py --source target.exe
+python nuitka_decompiler.py --source authorized_target.exe
 ```
 
 ### Include all library modules (not just main)
 
 ```bash
-python nuitka_decompiler.py --source target.exe --all
+python nuitka_decompiler.py --source authorized_target.exe --all
 ```
 
 ### Custom output directory
 
 ```bash
-python nuitka_decompiler.py --source target.exe --output ./unpacked
+python nuitka_decompiler.py --source authorized_target.exe --output ./unpacked
 ```
 
 ### List all modules without decompiling anything
 
 ```bash
-python list_modules.py target.exe
-python list_modules.py target.exe --filter myapp --copy-cmd
+python list_modules.py authorized_target.exe
+python list_modules.py authorized_target.exe --filter myapp --copy-cmd
 ```
 
 ### Restrict to specific modules (fast)
 
 ```bash
-python nuitka_decompiler.py --source target.exe --only mypackage,mypackage.utils
+python nuitka_decompiler.py --source authorized_target.exe --only mypackage,mypackage.utils
 ```
 
 ### Dynamic mode: inject into running process
 
 ```bash
-python nuitka_decompiler.py --source target.exe --inject --launch
+python nuitka_decompiler.py --source authorized_target.exe --inject --launch
 ```
 
 Or inject by PID:
 ```bash
-python nuitka_decompiler.py --source target.exe --inject --pid 1234
+python nuitka_decompiler.py --source authorized_target.exe --inject --pid 1234
 ```
 
 ---
@@ -444,7 +458,7 @@ This tool is intended for:
 
 **Do not use it on software you do not have authorization to analyze.** Respect licenses and applicable law.
 
-This repository is published for legitimate reverse engineering, interoperability research, malware analysis, and defensive security work — **not** for piracy, stalking competitors, or bypassing licenses. If you're unsure whether your use is permitted, don't run it.
+This repository is published for legitimate reverse engineering, interoperability research, malware analysis, and defensive security work. If you're unsure whether your use is permitted, get authorization first.
 
 ---
 

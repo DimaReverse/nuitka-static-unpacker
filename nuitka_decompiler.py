@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NUITKA STATIC UNPACKER - Static-first Nuitka unpacker (research tool) v7.2
+NUITKA STATIC UNPACKER - Static-first Nuitka unpacker (authorized research tool) v7.2
 by dimareverse
 
-PURELY STATIC mode - No runtime hooks, no injection.
-Analysis and recovery of Nuitka-compiled Python binaries.
+Static mode is the default: no runtime hooks, no injection.
+Use only on software you own or are authorized to inspect.
 
 Research focus:
-  1. Open-source blob format: CRC32+size header, named chunks, constant recovery
-  2. Commercial blob structure: encryption analysis and mapping reconstruction
-     - Mapping tables and digest patterns
-     - Module naming schemes and reconstruction strategies
+  1. Nuitka blob formats: headers, named chunks, and constants metadata
+  2. Supported protected metadata layouts for authorized inspection
   3. Module metadata extraction: module hierarchy and binary structure
-  4. Code object analysis: function signatures, code metadata recovery
-  5. Constant recovery: embedded strings, configuration data, code artifacts
+  4. Code object analysis: function signatures and code metadata
+  5. Constant inventory: embedded strings, configuration data, code artifacts
 
 Analysis output:
-  - .pyc extraction and bytecode recovery
+  - .pyc artifact extraction when present
   - Per-module constants analysis with recursive parsing
-  - Pattern scanning for configuration and artifact recovery
+  - Pattern scanning for configuration and potential-secrets review
   - Complete JSON analysis report
   - Code object metadata and structure mapping
 """
@@ -164,12 +162,12 @@ try:
 {C.BRIGHT_BLUE}   |_| \\_|\\__,_|_|\\__|_|\\_\\__,_|_|_/___\\__,_|\\__\\___/|_|   {C.RESET}
 
 {C.BOLD}{C.BRIGHT_WHITE}   <<<  Nuitka Static Unpacker v7.2 | by dimareverse  >>>{C.RESET}
-{C.BOLD}{C.BRIGHT_WHITE}   <<<  Static mode (default) | Dynamic injection (opt) >>>{C.RESET}
+{C.BOLD}{C.BRIGHT_WHITE}   <<<  Authorized static analysis | Dynamic lab mode (opt) >>>{C.RESET}
 """
 except Exception:
     BANNER = """
    Nuitka Static Unpacker v7.2 - by dimareverse
-   Static mode (default) | Dynamic injection (optional)
+   Authorized static analysis | Dynamic lab mode (optional)
 """
 
 
@@ -234,21 +232,19 @@ def log_fire(msg): print(f"{C.BRIGHT_RED}[>>]{C.RESET} {C.BOLD}{msg}{C.RESET}")
 
 
 # =============================================================================
-# NUITKA COMMERCIAL BYPASS - Constants Blob Decryption
+# SUPPORTED PROTECTED METADATA HANDLING
 # =============================================================================
 
 class CommercialBypass:
-    """Bypass Nuitka Commercial data-hiding plugin encryption.
+    """Research implementation for Nuitka Commercial data-hiding metadata.
 
-    Algorithm (from DataHidingPlugin.py):
-    - Encryption: substitution cipher + XOR with running counter + MD5 digest feedback
-    - Key material: _mapping[] (256 byte inverse subst table) + d0-d7 (8 MD5 digest bytes)
-    - Module names: mapping2 seeded with Random(27), always reconstructible
+    Use this only for binaries that you own or are authorized to inspect.
 
-    Detection: if CRC32 of the payload doesn't match after header, the blob is encrypted.
-    Key extraction: scan .text/.rdata for _mapping[] (256 byte lookup table) and d0-d7.
-    Strategy v2: try ALL mapping candidates x ALL d0-d7 candidates,
-                 validate each combination with CRC32 before accepting.
+    Algorithm summary:
+    - Protected constants metadata can use substitution + counter/XOR feedback
+    - Key material and digest-like byte patterns are searched in PE sections
+    - Candidate combinations are accepted only after CRC validation
+    - Module-name decoding is handled separately where supported
     """
 
     def __init__(self):
@@ -289,13 +285,7 @@ class CommercialBypass:
         return False
 
     def has_commercial_digest(self, blob_data: bytes) -> bool:
-        """Detect commercial data-hiding by checking for the 16-byte MD5 digest.
-
-        Commercial encryption inserts 16 bytes (encrypted digest) between
-        the 8-byte header and the module data, so:
-          encrypted_blob_size = 8 + 16 + original_data_size
-          → (blob_size - 8 - declared_size) == 16
-        """
+        """Detect a supported protected layout marker."""
         if len(blob_data) < 24:
             return False
         size_stored = struct.unpack('<I', blob_data[4:8])[0]
@@ -8898,7 +8888,7 @@ class NuitkalizatorPro:
     Pipeline:
     1. PE analysis (Python version, Nuitka edition)
     2. Constants blob extraction (PE resources or embedded)
-    3. Commercial encryption detection and bypass
+    3. Protected metadata detection and normalization
     4. Blob parsing into named modules
     5. .pyc extraction from .bytecode chunk
     6. Per-module constants parsing
@@ -9006,29 +8996,29 @@ class NuitkalizatorPro:
         edition = detect_nuitka_edition(pe_data, blob_data)
         self.report['nuitka_edition'] = edition
         if edition == "commercial":
-            log_fire("COMMERCIAL EDITION DETECTED (16-byte digest in blob)")
+            log_fire("Protected/commercial Nuitka metadata detected")
         else:
             log_ok(f"Edition: {edition}")
 
-        # === PHASE 3: Commercial encryption bypass ===
-        print_section("PHASE 3: ENCRYPTION DETECTION")
+        # === PHASE 3: Protected metadata handling ===
+        print_section("PHASE 3: PROTECTED METADATA CHECK")
 
         is_encrypted = self.bypass.is_blob_encrypted(blob_data)
         has_digest = self.bypass.has_commercial_digest(blob_data)
         self.report['encrypted'] = is_encrypted
 
         if has_digest:
-            log_fire(f"ENCRYPTED BLOB with commercial data-hiding (16-byte MD5 digest detected)")
+            log_fire("Protected constants metadata marker detected")
         elif is_encrypted:
-            log_fire("ENCRYPTED BLOB! (CRC32 mismatch)")
+            log_fire("Encoded constants metadata detected (CRC32 mismatch)")
 
         if is_encrypted:
-            log(f"Attempting Nuitka Commercial bypass...")
+            log("Attempting protected metadata normalization...")
 
             mapping_candidates, d_candidates = self.bypass.extract_key_material_from_pe(pe_data)
 
             if mapping_candidates is not None:
-                log_ok(f"Found {len(mapping_candidates)} _mapping[] candidates and {len(d_candidates) if d_candidates else 0} d0-d7 sets")
+                log_ok(f"Found {len(mapping_candidates)} metadata table candidates and {len(d_candidates) if d_candidates else 0} digest candidates")
 
                 if d_candidates is None:
                     d_candidates = []
@@ -9054,10 +9044,10 @@ class NuitkalizatorPro:
                 with open(key_path, 'w') as f:
                     json.dump(key_info, f, indent=2)
             else:
-                log_err("Unable to extract _mapping[] candidates from binary!")
+                log_err("Unable to normalize protected metadata for this binary")
                 log_warn("Attempting parsing anyway (may fail)...")
         else:
-            log_ok("Blob NOT encrypted (open-source edition)")
+            log_ok("Blob uses a plain metadata layout")
 
         # === PHASE 4: Parse blob into modules ===
         print_section("PHASE 4: MODULE PARSING")
@@ -9229,7 +9219,7 @@ class NuitkalizatorPro:
                 continue
 
             constants = parse_module_constants(chunk_data)
-            # Search constants for embedded Python source (crackme-style hidden source)
+            # Search constants for embedded source-like strings.
             const_src = search_constants_for_source(constants, module_name, self.output_dir)
             if const_src:
                 all_const_source_findings.extend(const_src)
@@ -10292,31 +10282,31 @@ def main():
     parser = argparse.ArgumentParser(
         epilog="""
 Examples:
-  # Pure static analysis
+  # Authorized static analysis
+  python nuitka_decompiler.py --source authorized_app.exe
 
-  # Dynamic mode: inject into already-running process
-  python nuitka_decompiler.py --source main.exe --inject --pid 1234
+  # Dynamic mode: controlled lab process you are allowed to instrument
+  python nuitka_decompiler.py --source authorized_app.exe --inject --pid 1234
 
   # Dynamic mode: launch and inject automatically
-  python nuitka_decompiler.py --source main.exe --inject --launch
+  python nuitka_decompiler.py --source authorized_app.exe --inject --launch
 
   # Full path overrides
-  python nuitka_decompiler.py --source main.exe --inject --launch \\
+  python nuitka_decompiler.py --source authorized_app.exe --inject --launch \\
       --dll hook64.dll --hook-script __hook__.py
 
 STATIC mode  : pure PE analysis, no runtime hooks.
-DYNAMIC mode : inject hook64.dll into a running (or auto-launched) process
-               to capture Python source from the live interpreter, then merge
-               with the static blob reconstruction.
+DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
+               process. Do not use on third-party software without permission.
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     # --- static / common ---
     parser.add_argument('--source', '-s', dest='source_flag', default=None,
                         metavar='FILE',
-                        help='Target .exe or .dll compiled with Nuitka (preferred flag)')
+                        help='Authorized .exe or .dll compiled with Nuitka (preferred flag)')
     parser.add_argument('target', nargs='?', default=None,
-                        help='Target .exe or .dll (positional — same as --source)')
+                        help='Authorized .exe or .dll (positional - same as --source)')
     parser.add_argument('--output', '-o', default=None, help='Output directory (default: auto)')
     parser.add_argument('--all', '-a', action='store_true',
                         help='Also analyze library modules (not just app)')
@@ -10324,10 +10314,10 @@ DYNAMIC mode : inject hook64.dll into a running (or auto-launched) process
                         help='Comma-separated list of module names to '
                              'disassemble (PHASE 11.7 only). Exact-match '
                              'or "pkg.*" wildcard supported. Skips recursive '
-                             'disasm for all other modules — much faster '
+                             'disasm for all other modules - much faster '
                              'when you only want one specific .nbc.')
     parser.add_argument('--list-modules', action='store_true', dest='list_modules',
-                        help='List all module names in the blob and exit. No decompilation.')
+                        help='List all module names in the blob and exit. No source reconstruction.')
     parser.add_argument('--filter', default=None, metavar='STR', dest='filter_str',
                         help='With --list-modules: only show modules containing STR.')
     parser.add_argument('--no-banner', action='store_true', help='Hide banner')
@@ -10337,11 +10327,11 @@ DYNAMIC mode : inject hook64.dll into a running (or auto-launched) process
     # --- dynamic injection ---
     inj = parser.add_argument_group('Dynamic injection (--inject required to enable)')
     inj.add_argument('--inject', action='store_true',
-                     help='Enable dynamic DLL injection mode after static analysis')
+                     help='Enable dynamic DLL injection mode after static analysis (authorized lab use only)')
     inj.add_argument('--launch', action='store_true',
-                     help='Auto-launch the target EXE before injecting')
+                     help='Auto-launch the authorized target EXE before injecting')
     inj.add_argument('--pid', type=int, default=None, metavar='PID',
-                     help='Inject into a specific PID (skips --launch)')
+                     help='Inject into a specific authorized PID (skips --launch)')
     inj.add_argument('--dll', default=_default_dll, metavar='PATH',
                      help=f'hook64.dll path (default: {_default_dll})')
     inj.add_argument('--hook-script', default=_default_hook, metavar='PATH',
@@ -10359,7 +10349,7 @@ DYNAMIC mode : inject hook64.dll into a running (or auto-launched) process
     # Resolve target: --source takes priority over positional
     target = args.source_flag or args.target
     if not target:
-        parser.error("Specify the target binary: --source main.exe  or positionally: main.exe")
+        parser.error("Specify an authorized target binary, e.g. --source authorized_app.exe")
 
     if args.output:
         out_dir = args.output
