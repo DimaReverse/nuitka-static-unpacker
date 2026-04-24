@@ -42,6 +42,15 @@ It can also optionally switch to a **dynamic mode** via DLL injection to capture
 
 ## Quick start
 
+### Supported targets
+
+This tool works with:
+- **`.exe` files** compiled with Nuitka (any edition: open-source or commercial)
+- **`.dll` files** compiled with Nuitka — common in modern Nuitka builds where the entry point is packaged as a DLL
+- Both standard Nuitka and Nuitka Commercial (with data-hiding encryption)
+
+Analysis mode is identical regardless of file type — just pass `--source target.dll` instead of `.exe`.
+
 ### Important (onefile targets)
 
 If your target is a **Nuitka onefile** executable, you need to **extract the embedded payload first** before running this tool. Two options depending on the outer protection layer:
