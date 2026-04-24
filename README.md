@@ -80,6 +80,77 @@ More examples and the full flag reference: [`docs/usage.md`](docs/usage.md).
 
 ## What's new in v7.2
 
+### Update: AI-ready NBC/2 reconstruction bundle
+
+The static pipeline now emits self-contained `.nbc` files intended for
+maximum-fidelity source reconstruction by an LLM or a human reverse engineer.
+These files are the best handoff format for source rebuilding because they keep
+the decoded constants, module metadata, code object metadata, native evidence,
+and provenance together in one text artifact.
+
+The clean handoff directory is:
+
+```text
+OUT/
+|-- AI_READY_NBC/
+|   |-- nbc/                  # primary .nbc files to feed to the AI
+|   |-- context/              # REPORT, module table, runtime helpers, manifests
+|   |-- NBC_MANIFEST.json     # file list, hashes, has_ops/has_no_ops status
+|   `-- README_AI.md
+```
+
+Recommended focused workflow:
+
+```bash
+python nuitka_decompiler.py --source target.exe --list-modules --filter myapp
+python nuitka_decompiler.py --source target.exe --output OUT --only myapp,myapp.* --no-pyc-decompile
+```
+
+`--no-pyc-decompile` skips the classic `.pyc -> .py` backend phase and keeps the
+run focused on the richer NBC/LLM evidence bundle. This is usually the cleanest
+mode when your next step is AI-assisted reconstruction.
+
+Each `NBC/2` file can include:
+
+- full decoded `@CONSTS` with untruncated Python `repr()` values
+- `@RAW_CHUNK` with base64 of the original Nuitka constants chunk
+- loader-table metadata in `@MODULE_TABLE`
+- `@CODE_OBJECTS`, `@BLOCKS`, `@OPS`, and annotated native `@ASM`
+- `@FORENSICS` evidence for functions whose bodies were not reached
+
+#### Rebuilding source with an LLM and the skill
+
+Use this flow for authorized samples where you want the highest-fidelity Python
+reconstruction possible:
+
+1. List modules first, then pick only the package or files you actually need.
+2. Generate the AI bundle with `--output OUT --only package,package.* --no-pyc-decompile`.
+3. Open `OUT/AI_READY_NBC/NBC_MANIFEST.json` and prioritize entries with `"has_ops": true`.
+4. Feed the LLM one `.nbc` file at a time from `OUT/AI_READY_NBC/nbc/`.
+5. Add optional context files from `OUT/AI_READY_NBC/context/`, especially `REPORT.json`, `NUITKA_MODULE_TABLE.txt`, `NUITKA_RUNTIME_HELPERS.txt`, `_MANIFEST.json`, and `BYTECODE_MANIFEST.json` when present.
+6. Give the LLM the rebuilder instructions from `nuitka-nbc-rebuilder-skill/SKILL.md`, or use the standalone prompt in `nuitka-nbc-rebuilder-skill/PROMPT.md`.
+7. Ask for evidence-backed Python and require uncertain spans to stay marked as `# UNCERTAIN`.
+8. Review every `# UNCERTAIN` marker manually before treating the rebuilt file as source-equivalent.
+
+For a package, rebuild in dependency order when possible: `__init__`, config and
+utility modules, core modules, then the entrypoint. For large targets, avoid
+passing the whole bundle at once; use the manifest plus `--only` to keep each LLM
+job small and auditable.
+
+Minimal prompt:
+
+```text
+Rebuild this NBC module into Python with maximum fidelity.
+Use only evidence from @CONSTS, @OPS, @ASM, @FORENSICS and the provided context files.
+Mark unsupported spans with # UNCERTAIN.
+```
+
+**Important accuracy note:** no static Nuitka decompiler can guarantee a
+perfect 1:1 reproduction of the original `.py` file in every case. Comments,
+formatting, some local variable names, and optimized/inlined control flow may
+be unrecoverable. The `.nbc` format is designed to maximize evidence and make
+an AI mark uncertain spans explicitly instead of fabricating code.
+
 - **`list_modules.py`** — standalone script: lists every module inside a binary in ~1 second, zero decompilation, zero output files
 - **`--list-modules` flag** — same functionality directly inside `nuitka_decompiler.py`
 - **`--filter STR`** — narrow the module list to names containing a string
@@ -119,6 +190,7 @@ python nuitka_decompiler.py --source target.exe --list-modules --filter config
 - [`docs/architecture.md`](docs/architecture.md) — pipeline + key components
 - [`docs/nuitka_blob_format.md`](docs/nuitka_blob_format.md) — constants blob format notes
 - [`docs/roadmap.md`](docs/roadmap.md) — roadmap / known gaps
+- [`nuitka-nbc-rebuilder-skill/`](nuitka-nbc-rebuilder-skill/) - LLM skill and prompt for rebuilding Python from AI-ready `.nbc` files
 
 ---
 
@@ -170,6 +242,7 @@ If this project helps you, or if you build something on top of it, that means mo
 - **Fast module listing**: `list_modules.py` / `--list-modules` — see all module names in ~1 second without running the full pipeline.
 - **`.pyc` extraction**: recovers bytecode and writes per-module artifacts.
 - **Code object map**: function signatures / args / line metadata (where recoverable).
+- **AI-ready NBC/2 bundle**: writes self-contained `.nbc` evidence files plus a rebuilder skill workflow for LLM-assisted source reconstruction.
 - **Secrets scanner**: finds likely passwords/keys/URLs in extracted constants.
 - **Multi-backend decompilation**: tries multiple decompilers and falls back gracefully.
 - **JSON report**: writes a global `REPORT.json` plus per-module outputs.
@@ -285,6 +358,17 @@ output/
 ├── REPORT.json              # Full extraction report
 ├── secrets.txt              # Potential passwords, keys, tokens found
 └── DYNAMIC_SOURCE/          # (if --inject used) live-captured sources
+```
+
+The AI-assisted reconstruction workflow also writes:
+
+```text
+output/
+`-- AI_READY_NBC/
+    |-- nbc/                  # Feed these .nbc files to the LLM
+    |-- context/              # Reports, helper notes, module table, manifests
+    |-- NBC_MANIFEST.json     # Start here to choose modules with has_ops=true
+    `-- README_AI.md          # Per-run handoff notes
 ```
 
 ### Important note about extracted `.pyc`

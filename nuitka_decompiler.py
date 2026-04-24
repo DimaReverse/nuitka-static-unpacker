@@ -34,6 +34,7 @@ import json
 import zlib
 import random
 import hashlib
+import base64
 import argparse
 import re
 import math
@@ -1294,6 +1295,20 @@ def is_main_module(name):
         if base == lib.lower() or base.startswith(lib.lower()):
             return False
     return True
+
+
+def module_matches_patterns(name, patterns):
+    """Match exact module names or `pkg.*` globs used by --only."""
+    if not patterns:
+        return True
+    for pat in patterns:
+        if pat.endswith('.*'):
+            prefix = pat[:-2]
+            if name == prefix or name.startswith(prefix + '.'):
+                return True
+        elif pat == name:
+            return True
+    return False
 
 
 # Module-level tracker for the 'p' (previous) constant tag
@@ -4838,10 +4853,195 @@ class NuitkaCompactEmitter:
         return r if len(r) <= cap else r[:cap - 3] + '...'
 
     @classmethod
-    def _emit_constants(cls, constants, out):
-        out.append(f"@CONSTS {len(constants)}")
+    def _full_repr(cls, v):
+        try:
+            return repr(v)
+        except Exception as e:
+            return f'<repr failed: {type(v).__name__}: {e}>'
+
+    @classmethod
+    def _emit_constants(cls, constants, out, *, full=True):
+        mode = 'full_repr' if full else 'compact_repr'
+        out.append(f"@CONSTS {len(constants)} mode={mode}")
         for i, v in enumerate(constants):
-            out.append(f"  {i} {cls._type_code(v)} {cls._short_repr(v)}")
+            rep = cls._full_repr(v) if full else cls._short_repr(v)
+            out.append(f"  {i} {cls._type_code(v)} {rep}")
+
+    @classmethod
+    def _emit_raw_chunk(cls, chunk_bytes, out):
+        """Embed the original per-module Nuitka constants chunk.
+
+        The decoded constants are what an LLM normally needs, but keeping
+        the raw chunk in the same `.nbc` makes the file self-contained:
+        another tool can re-parse it, verify our decoder, or recover a tag
+        we do not yet understand without going back to the executable.
+        """
+        if not chunk_bytes:
+            return
+        chunk = bytes(chunk_bytes)
+        out.append('@RAW_CHUNK')
+        out.append(f'  size: {len(chunk)}')
+        out.append(f'  sha256: {hashlib.sha256(chunk).hexdigest()}')
+        out.append('  encoding: base64')
+        b64 = base64.b64encode(chunk).decode('ascii')
+        out.append('  data:')
+        for i in range(0, len(b64), 120):
+            out.append('    ' + b64[i:i + 120])
+        out.append('')
+
+    @staticmethod
+    def _module_table_value(entry, key, default=''):
+        if not entry:
+            return default
+        value = entry.get(key, default)
+        if isinstance(value, int):
+            return f'0x{value:X}' if key.endswith('ptr') or key.endswith('va') else str(value)
+        if isinstance(value, (list, tuple)):
+            return ','.join(str(x) for x in value)
+        return str(value)
+
+    @classmethod
+    def _emit_module_table_entry(cls, module_table_entry, out):
+        if not module_table_entry:
+            return
+        out.append('@MODULE_TABLE')
+        out.append(f"  name: {module_table_entry.get('name', '')}")
+        out.append(f"  func_ptr: 0x{module_table_entry.get('func_ptr', 0):X}")
+        out.append(f"  flags: {','.join(module_table_entry.get('flag_names') or [])}")
+        out.append(f"  bytecode_index: {module_table_entry.get('bytecode_index', -1)}")
+        out.append(f"  bytecode_size: {module_table_entry.get('bytecode_size', -1)}")
+        out.append('')
+
+    @classmethod
+    def _emit_code_objects(cls, module_name, constants, out):
+        code_objects = []
+
+        def walk(v):
+            if isinstance(v, dict):
+                if v.get('_type') == 'CodeObject':
+                    code_objects.append(v)
+                for item in v.values():
+                    walk(item)
+            elif isinstance(v, (tuple, list, set, frozenset)):
+                for item in v:
+                    walk(item)
+
+        for c in constants:
+            walk(c)
+
+        seen = set()
+        unique = []
+        for co in code_objects:
+            key = (
+                co.get('name'),
+                co.get('qualname'),
+                co.get('line'),
+                co.get('argcount'),
+                tuple(co.get('args') or ()),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(co)
+
+        if not unique:
+            return
+        out.append(f'@CODE_OBJECTS {len(unique)}')
+        for co in unique:
+            args = ', '.join(str(a) for a in (co.get('args') or ()))
+            flags = co.get('flags', 0)
+            extras = []
+            if co.get('posonly'):
+                extras.append(f"posonly={co.get('posonly')}")
+            if co.get('kwonly'):
+                extras.append(f"kwonly={co.get('kwonly')}")
+            if co.get('freevars'):
+                extras.append(f"freevars={tuple(co.get('freevars'))!r}")
+            if flags:
+                extras.append(f"flags=0x{flags:X}")
+            suffix = '  # ' + ' '.join(extras) if extras else ''
+            qn = co.get('qualname') or co.get('name') or '<unknown>'
+            line = co.get('line', '?')
+            out.append(f"  line={line} qualname={qn!r} def {co.get('name', '<unknown>')}({args}){suffix}")
+        out.append('')
+
+    @classmethod
+    def _emit_block_summary(cls, disasm_infos, runtime_aliases, out):
+        if not disasm_infos:
+            return
+        out.append(f'@BLOCKS {len(disasm_infos)}')
+        for va, info in disasm_infos.items():
+            calls = info.get('calls') or []
+            capi = sum(1 for c in calls if c.get('kind') == 'capi')
+            internal = sum(1 for c in calls if c.get('kind') == 'internal')
+            const_loads = len(info.get('const_loads') or [])
+            fps = len(info.get('func_ptr_loads') or [])
+            ret = 'yes' if info.get('reached_ret') else 'no'
+            out.append(
+                f"  0x{va:X} insns={info.get('instruction_count', 0)} "
+                f"ret={ret} calls_internal={internal} calls_capi={capi} "
+                f"const_loads={const_loads} func_ptr_loads={fps}"
+            )
+        out.append('')
+
+    @classmethod
+    def _emit_native_asm(cls, disasm_info, constants, mod_consts_base,
+                         runtime_aliases, out):
+        if not disasm_info:
+            return
+
+        fn_va = disasm_info.get('func_va')
+        out.append(f'@ASM 0x{fn_va:X}')
+
+        call_by_va = {c['va_from']: c for c in disasm_info.get('calls', [])}
+        const_by_va = {cl['va_from']: cl for cl in disasm_info.get('const_loads', [])}
+        fp_by_va = {fp['va_from']: fp for fp in disasm_info.get('func_ptr_loads', [])}
+
+        def resolve_const(va):
+            if mod_consts_base is None or not constants or va is None:
+                return None
+            if va < mod_consts_base:
+                return None
+            offset = va - mod_consts_base
+            if offset % 8:
+                return None
+            idx = offset // 8
+            if 0 <= idx < len(constants):
+                return idx, constants[idx]
+            return None
+
+        for va, mnem, ops in disasm_info.get('raw_disasm', []):
+            comments = []
+            if va in const_by_va:
+                cl = const_by_va[va]
+                resolved = resolve_const(cl.get('target_va'))
+                if resolved is not None:
+                    idx, value = resolved
+                    comments.append(f'const c[{idx}]={cls._short_repr(value, cap=180)}')
+                else:
+                    comments.append(f"data 0x{cl.get('target_va', 0):X} [{cl.get('section', '?')}]")
+            if va in fp_by_va:
+                comments.append(f"func_ptr 0x{fp_by_va[va].get('target_va', 0):X}")
+            if va in call_by_va:
+                c = call_by_va[va]
+                if c.get('kind') == 'capi':
+                    comments.append(f"{c.get('dll')}!{c.get('name')}")
+                elif c.get('kind') == 'internal':
+                    if c.get('module'):
+                        comments.append(f"module_code_{c.get('module')}")
+                    else:
+                        alias = runtime_aliases.get(c.get('target'))
+                        comments.append(alias or f"internal_0x{c.get('target', 0):X}")
+                elif c.get('target') is not None:
+                    comments.append(f"{c.get('kind')} 0x{c.get('target'):X}")
+                else:
+                    comments.append(str(c.get('kind')))
+
+            line = f'  0x{va:X}: {mnem:<8} {ops}'
+            if comments:
+                line += '  ; ' + ' ; '.join(comments)
+            out.append(line)
+        out.append('')
 
     @classmethod
     def _emit_imports(cls, module_name, constants, out):
@@ -5332,7 +5532,8 @@ class NuitkaCompactEmitter:
     def render(cls, module_name, constants, python_version,
                disasm_info=None, disasm_infos=None, mod_consts_base=None,
                runtime_aliases=None, entry_va=None,
-               ops_absence_reason=None):
+               ops_absence_reason=None, module_table_entry=None,
+               chunk_bytes=None, full=True, include_native_asm=True):
         """Produce the text content for `<module>.nbc`.
 
         Either `disasm_info` (single-block) OR `disasm_infos` (dict of
@@ -5353,21 +5554,27 @@ class NuitkaCompactEmitter:
         """
         runtime_aliases = runtime_aliases or {}
         out = []
-        out.append('# Nuitka static reconstruction (compact). Feed to an LLM.')
+        out.append('# Nuitka static reconstruction. Feed this .nbc file to an LLM.')
+        out.append('# Format version: NBC/2 full self-contained module record.')
         out.append('# c[N]=mod_consts[N]   r#N=runtime_helper_rank   capi:=Python C API')
         out.append('# Multiple @OPS blocks = one per disassembled function '
                    '(module entry + every internal call target reached via BFS).')
         out.append('')
+        out.append('@NBC 2')
         out.append(f'@MOD {module_name or "__module__"}')
         out.append(f'@VER {python_version[0]}.{python_version[1]}')
         if entry_va is not None:
             out.append(f'@ENTRY 0x{entry_va:X}')
         out.append('')
-        cls._emit_constants(list(constants), out)
+        cls._emit_module_table_entry(module_table_entry, out)
+        cls._emit_raw_chunk(chunk_bytes, out)
+        cls._emit_constants(list(constants), out, full=full)
         out.append('')
         cls._emit_imports(module_name, constants, out)
         out.append('')
         cls._emit_funcs_detected(module_name, constants, out)
+        out.append('')
+        cls._emit_code_objects(module_name, list(constants), out)
         out.append('')
         # Normalise: prefer disasm_infos (multi), fall back to disasm_info (single)
         infos_dict = None
@@ -5376,6 +5583,7 @@ class NuitkaCompactEmitter:
         elif disasm_info:
             infos_dict = {disasm_info['func_va']: disasm_info}
         if infos_dict:
+            cls._emit_block_summary(infos_dict, runtime_aliases, out)
             # Build an authoritative func_va -> qualname map by
             # aggregating every `make_function_hints` pair across all
             # disassembled blocks. This is much more accurate than
@@ -5481,6 +5689,9 @@ class NuitkaCompactEmitter:
                                       va_to_qualname=va_to_qualname,
                                       suppress_fallback_label=is_module_entry)
                 out.append('')
+                if include_native_asm:
+                    cls._emit_native_asm(info, constants, mod_consts_base,
+                                         runtime_aliases, out)
 
             # --- FORENSICS section ------------------------------------
             # For qualnames that appear in @CONSTS but never got an
@@ -7053,6 +7264,8 @@ class StaticalyExtractor:
             for name, chunk_data in chunks:
                 if name == '.bytecode':
                     continue
+                if self.only_modules and not module_matches_patterns(name, self.only_modules):
+                    continue
                 try:
                     items = parse_module_constants(chunk_data)
                 except Exception:
@@ -7063,7 +7276,13 @@ class StaticalyExtractor:
             return sections
 
         raw = NuitkaBlobDecoder().decode_blob(self.blob)
-        return self._normalize_decoded_sections(raw)
+        sections = self._normalize_decoded_sections(raw)
+        if self.only_modules:
+            sections = {
+                name: items for name, items in sections.items()
+                if module_matches_patterns(name, self.only_modules)
+            }
+        return sections
 
     def raw_scan_bytecode(self):
         """Run xdis raw scan for embedded marshal code objects. Returns
@@ -7210,6 +7429,7 @@ class StaticalyExtractor:
         dump_written = 0
         used_paths = {}   # rel_path -> collision counter, to dedupe
         manifest = []     # list of {section, rel_path, has_class_def}
+        mt_by_name = {e.get('name'): e for e in self.module_table} if self.module_table else {}
 
         for name, items in sections.items():
             if not items:
@@ -7306,6 +7526,8 @@ class StaticalyExtractor:
                         constants=items_list,
                         python_version=self.target_python,
                         ops_absence_reason=_reason,
+                        module_table_entry=mt_by_name.get(name),
+                        chunk_bytes=chunk_raw_bytes.get(name),
                     )
                     nbc_path = dest.with_suffix('.nbc')
                     nbc_path.write_text(nbc_text, encoding='utf-8')
@@ -7387,7 +7609,13 @@ class StaticalyExtractor:
         # stay consistent across every module's disassembly so you can
         # trace helper usage globally.
         try:
-            runtime_aliases, call_counter = disasm.build_module_call_stats(targets)
+            stats_targets = targets
+            CALL_STATS_SAMPLE_LIMIT = 120
+            if len(stats_targets) > CALL_STATS_SAMPLE_LIMIT:
+                stats_targets = stats_targets[:CALL_STATS_SAMPLE_LIMIT]
+                log(f"  Runtime-helper prepass: sampling "
+                    f"{len(stats_targets)}/{len(targets)} module entries")
+            runtime_aliases, call_counter = disasm.build_module_call_stats(stats_targets)
         except Exception:
             runtime_aliases, call_counter = {}, {}
 
@@ -7396,16 +7624,8 @@ class StaticalyExtractor:
         # actually get full per-function recursive disasm + rendering.
         only = getattr(self, 'only_modules', None)
         if only:
-            def _match(name):
-                for pat in only:
-                    if pat.endswith('.*'):
-                        prefix = pat[:-2]
-                        if name == prefix or name.startswith(prefix + '.'):
-                            return True
-                    elif pat == name:
-                        return True
-                return False
-            filtered = [e for e in targets if _match(e['name'])]
+            filtered = [e for e in targets
+                        if module_matches_patterns(e['name'], only)]
             log(f"  --only filter: {len(filtered)} of {len(targets)} "
                 f"module(s) match {only}")
             targets = filtered
@@ -7470,6 +7690,8 @@ class StaticalyExtractor:
                     mod_consts_base=base,
                     runtime_aliases=runtime_aliases,
                     entry_va=func_ptr,
+                    module_table_entry=entry,
+                    chunk_bytes=getattr(self, 'chunk_raw_bytes', {}).get(mod_name),
                 )
 
                 # Guard against runaway file size. Raised to 8 MB so
@@ -7479,7 +7701,7 @@ class StaticalyExtractor:
                 # information). Wrappers are identified by tiny
                 # instruction count AND membership in the helper
                 # range; bodies are everything else.
-                HARD_CAP_BYTES = 8_000_000
+                HARD_CAP_BYTES = 128_000_000
                 if len(nbc_text.encode('utf-8', errors='replace')) > HARD_CAP_BYTES:
                     # Strategy: keep entry + every block with
                     # `instruction_count >= 30` (real code). Drop
@@ -7499,6 +7721,8 @@ class StaticalyExtractor:
                         mod_consts_base=base,
                         runtime_aliases=runtime_aliases,
                         entry_va=func_ptr,
+                        module_table_entry=entry,
+                        chunk_bytes=getattr(self, 'chunk_raw_bytes', {}).get(mod_name),
                     )
                     # If STILL too large after dropping wrappers, chop
                     # the lowest-instruction-count bodies until under
@@ -7525,6 +7749,8 @@ class StaticalyExtractor:
                                 mod_consts_base=base,
                                 runtime_aliases=runtime_aliases,
                                 entry_va=func_ptr,
+                                module_table_entry=entry,
+                                chunk_bytes=getattr(self, 'chunk_raw_bytes', {}).get(mod_name),
                             )
                             if len(candidate.encode('utf-8', errors='replace')) <= HARD_CAP_BYTES:
                                 best_text = candidate
@@ -8682,7 +8908,7 @@ class NuitkalizatorPro:
     """
 
     def __init__(self, target_path: str, output_dir: str, main_only: bool = False,
-                 only_modules=None):
+                 only_modules=None, decompile_pyc: bool = True):
         self.target = target_path
         self.output_dir = output_dir
         self.main_only = main_only
@@ -8690,6 +8916,7 @@ class NuitkalizatorPro:
         # PHASE 11.7 recursive disassembly to. `None` = disassemble all
         # compiled modules (the default behaviour).
         self.only_modules = only_modules
+        self.decompile_pyc = decompile_pyc
         self.bypass = CommercialBypass()
         self.report = {
             'target': os.path.basename(target_path),
@@ -8853,6 +9080,16 @@ class NuitkalizatorPro:
                 log(f"  {icon} {name} ({len(data):,} bytes)")
 
         self.report['stats']['total_modules'] = len(modules)
+        analysis_module_chunks = module_chunks
+        if self.only_modules:
+            analysis_module_chunks = [
+                (name, data) for name, data in module_chunks
+                if module_matches_patterns(name, self.only_modules)
+            ]
+            log(f"  --only analysis filter: {len(analysis_module_chunks)} "
+                f"of {len(module_chunks)} constants chunks match {self.only_modules}")
+            self.report['stats']['only_modules_filter'] = list(self.only_modules)
+            self.report['stats']['only_modules_matched'] = len(analysis_module_chunks)
 
         # Save raw module chunks as .nuitka_const in a single folder (library_modules-style)
         nuitka_const_dir = os.path.join(self.output_dir, "library_modules")
@@ -8982,9 +9219,9 @@ class NuitkalizatorPro:
         module_info_list = []
         all_const_source_findings = []
 
-        pb = ProgressBar(len(module_chunks), desc="Parsing module constants")
+        pb = ProgressBar(len(analysis_module_chunks), desc="Parsing module constants")
 
-        for module_name, chunk_data in module_chunks:
+        for module_name, chunk_data in analysis_module_chunks:
             pb.update()
 
             is_main = is_main_module(module_name)
@@ -9191,7 +9428,7 @@ class NuitkalizatorPro:
             _decompiled_count = 0
             _decompile_report = []
 
-            for _mod_name, _mod_data in module_chunks:
+            for _mod_name, _mod_data in analysis_module_chunks:
                 try:
                     _consts, _ = _bp.parse_module(bytes(_mod_data), _mod_name)
                     _src = reconstruct_python_source(_mod_name, _consts)
@@ -9247,8 +9484,8 @@ class NuitkalizatorPro:
 
         c_generated = 0
         c_total_lines = 0
-        c_pb = ProgressBar(len(module_chunks), desc="Generating .c files")
-        for module_name, chunk_data in module_chunks:
+        c_pb = ProgressBar(len(analysis_module_chunks), desc="Generating .c files")
+        for module_name, chunk_data in analysis_module_chunks:
             c_pb.update()
             try:
                 constants = parse_module_constants(chunk_data)
@@ -9365,15 +9602,23 @@ class NuitkalizatorPro:
 
         # Collect all .pyc files extracted in Phase 5
         pyc_files = []
-        if os.path.exists(pyc_dir):
+        if not self.decompile_pyc:
+            log_warn("Skipping .pyc decompilation (--no-pyc-decompile).")
+            self.report.setdefault('decompilation', {}).update({
+                'skipped': True,
+                'reason': '--no-pyc-decompile',
+                'output_dir': src_dir,
+            })
+        elif os.path.exists(pyc_dir):
             for _root, _dirs, _fnames in os.walk(pyc_dir):
                 for _fn in sorted(_fnames):
                     if _fn.endswith('.pyc'):
                         pyc_files.append(os.path.join(_root, _fn))
 
         if not pyc_files:
-            log_warn("No .pyc files found (Phase 5 may have found no bytecode chunk).")
-            log_warn("This binary may be fully C-compiled (no Python bytecode to decompile).")
+            if self.decompile_pyc:
+                log_warn("No .pyc files found (Phase 5 may have found no bytecode chunk).")
+                log_warn("This binary may be fully C-compiled (no Python bytecode to decompile).")
         else:
             log(f"Found {len(pyc_files)} .pyc file(s) to decompile")
 
@@ -9444,7 +9689,21 @@ class NuitkalizatorPro:
         with open(report_path, 'w', encoding='utf-8') as f:
             json.dump(self.report, f, indent=2, ensure_ascii=False, default=str)
 
+        ai_ready = organize_ai_ready_nbc(self.output_dir)
+        self.report['ai_ready_nbc'] = ai_ready
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(self.report, f, indent=2, ensure_ascii=False, default=str)
+        try:
+            import shutil as _shutil
+            _ctx = Path(ai_ready.get('context_dir', ''))
+            if _ctx.exists():
+                _shutil.copy2(report_path, _ctx / 'REPORT.json')
+        except Exception:
+            pass
+
         log_ok(f"Report saved: {report_path}")
+        if ai_ready.get('files'):
+            log_ok(f"AI-ready .nbc bundle: {ai_ready['files']} file(s) -> {ai_ready['output_dir']}")
 
         # === SUMMARY ===
         print_section("FINAL RESULTS")
@@ -9455,8 +9714,11 @@ class NuitkalizatorPro:
         _dec_total  = _dec_report.get('total', 0)
         _dec_chain  = _dec_report.get('decompiler_chain') or [_dec_report.get('decompiler', 'none')]
         _dec_tool   = ', '.join(_dec_chain)
-        _dec_line   = (f"{_dec_ok_n}/{_dec_total} files  [{_dec_tool}]"
-                       if _dec_total else "n/a (no bytecode chunk)")
+        if _dec_report.get('skipped'):
+            _dec_line = f"skipped [{_dec_report.get('reason', 'requested')}]"
+        else:
+            _dec_line = (f"{_dec_ok_n}/{_dec_total} files  [{_dec_tool}]"
+                         if _dec_total else "n/a (no bytecode chunk)")
 
         print(f"""
   {C.BRIGHT_WHITE}Target:{C.RESET}                {self.report['target']}
@@ -9473,6 +9735,7 @@ class NuitkalizatorPro:
   {C.BRIGHT_RED}Secrets found:{C.RESET}         {stats.get('total_secrets', 0)}
 
   {C.BRIGHT_WHITE}Output:{C.RESET}                {self.output_dir}
+  {C.BRIGHT_WHITE}AI-ready .nbc:{C.RESET}         {ai_ready.get('output_dir', 'n/a')}
   {C.BRIGHT_WHITE}Source files:{C.RESET}          {os.path.join(self.output_dir, 'modules')}
 """)
 
@@ -9483,6 +9746,134 @@ class NuitkalizatorPro:
         print(C.RESET)
 
         return True
+
+
+def organize_ai_ready_nbc(output_dir: str) -> dict:
+    """Create a clean, LLM-facing output tree for the generated `.nbc` files.
+
+    The main extractor intentionally keeps legacy folders for compatibility.
+    This post-pass gives the reverse-engineering workflow one obvious place
+    to look: `AI_READY_NBC/nbc/` plus a small context bundle and manifest.
+    """
+    root = Path(output_dir).resolve()
+    src_tree = root / "staticaly" / "omni_reconstructed"
+    ready_dir = root / "AI_READY_NBC"
+    nbc_dir = ready_dir / "nbc"
+    ctx_dir = ready_dir / "context"
+
+    result = {
+        'output_dir': str(ready_dir),
+        'nbc_dir': str(nbc_dir),
+        'context_dir': str(ctx_dir),
+        'files': 0,
+        'with_ops': 0,
+        'without_ops': 0,
+        'manifest': str(ready_dir / 'NBC_MANIFEST.json'),
+    }
+
+    if not src_tree.exists():
+        return result
+
+    try:
+        resolved_ready = ready_dir.resolve()
+        if resolved_ready.exists() and resolved_ready.is_relative_to(root):
+            import shutil as _shutil
+            _shutil.rmtree(resolved_ready)
+    except Exception:
+        pass
+
+    nbc_dir.mkdir(parents=True, exist_ok=True)
+    ctx_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = []
+    import shutil as _shutil
+
+    for src in sorted(src_tree.rglob('*.nbc')):
+        rel = src.relative_to(src_tree)
+        dst = nbc_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copy2(src, dst)
+
+        try:
+            text = dst.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            text = ''
+
+        module_name = ''
+        const_count = None
+        for line in text.splitlines()[:80]:
+            if line.startswith('@MOD '):
+                module_name = line[5:].strip()
+            elif line.startswith('@CONSTS '):
+                try:
+                    const_count = int(line.split()[1])
+                except Exception:
+                    const_count = None
+
+        lines = text.splitlines()
+        has_ops = any(line.startswith('@OPS ') for line in lines)
+        # A bare @NO_OPS means the module has no disassembly. In the
+        # @FORENSICS section, "@NO_OPS <qualname>" only marks a single
+        # orphan function and should not classify the whole module as failed.
+        has_no_ops = any(line.strip() == '@NO_OPS' for line in lines)
+        data = dst.read_bytes()
+        item = {
+            'module': module_name,
+            'path': str(rel).replace(os.sep, '/'),
+            'bytes': len(data),
+            'sha256': hashlib.sha256(data).hexdigest(),
+            'constants': const_count,
+            'has_ops': has_ops,
+            'has_no_ops': has_no_ops,
+        }
+        manifest.append(item)
+        result['files'] += 1
+        if has_ops:
+            result['with_ops'] += 1
+        if has_no_ops and not has_ops:
+            result['without_ops'] += 1
+
+    context_files = [
+        root / 'REPORT.json',
+        root / 'NUITKA_MODULE_TABLE.txt',
+        root / 'CODE_OBJECT_MAP.txt',
+        root / 'BYTECODE_MANIFEST.json',
+        src_tree / '_MANIFEST.json',
+        src_tree / 'NUITKA_RUNTIME_HELPERS.txt',
+    ]
+    for src in context_files:
+        if src.exists() and src.is_file():
+            try:
+                _shutil.copy2(src, ctx_dir / src.name)
+            except Exception:
+                pass
+
+    manifest_path = ready_dir / 'NBC_MANIFEST.json'
+    manifest_path.write_text(
+        json.dumps({
+            'created_at': datetime.now().isoformat(),
+            'source_tree': str(src_tree),
+            'nbc_files': result['files'],
+            'with_ops': result['with_ops'],
+            'without_ops': result['without_ops'],
+            'entries': manifest,
+        }, indent=2, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    readme = ready_dir / 'README_AI.md'
+    readme.write_text(
+        "# AI-ready Nuitka NBC bundle\n\n"
+        "Use files under `nbc/` as the primary input for source reconstruction.\n"
+        "Each `.nbc` is self-contained: full decoded constants, raw chunk "
+        "base64, loader-table metadata when available, virtual `@OPS`, and "
+        "annotated native `@ASM` blocks when static disassembly succeeded.\n\n"
+        "Prefer files with `has_ops: true` in `NBC_MANIFEST.json`; files "
+        "with `@NO_OPS` contain constants and metadata only.\n",
+        encoding='utf-8',
+    )
+
+    return result
 
 
 def _safe_repr(val, max_len=500):
@@ -9940,6 +10331,8 @@ DYNAMIC mode : inject hook64.dll into a running (or auto-launched) process
     parser.add_argument('--filter', default=None, metavar='STR', dest='filter_str',
                         help='With --list-modules: only show modules containing STR.')
     parser.add_argument('--no-banner', action='store_true', help='Hide banner')
+    parser.add_argument('--no-pyc-decompile', action='store_true',
+                        help='Skip Phase 12 .pyc -> .py decompilation; useful when preparing only .nbc files.')
 
     # --- dynamic injection ---
     inj = parser.add_argument_group('Dynamic injection (--inject required to enable)')
@@ -9959,6 +10352,9 @@ DYNAMIC mode : inject hook64.dll into a running (or auto-launched) process
                      help='Seconds to wait for the hook dump (default: 120)')
 
     args = parser.parse_args()
+    if args.no_banner:
+        global BANNER
+        BANNER = ""
 
     # Resolve target: --source takes priority over positional
     target = args.source_flag or args.target
@@ -10034,6 +10430,7 @@ DYNAMIC mode : inject hook64.dll into a running (or auto-launched) process
             output_dir=out_dir,
             main_only=not args.all,
             only_modules=only_list,
+            decompile_pyc=not args.no_pyc_decompile,
         )
         success = engine.run()
 
