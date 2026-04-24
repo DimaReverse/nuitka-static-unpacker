@@ -13,6 +13,7 @@
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Lines](https://img.shields.io/badge/lines%20of%20code-10%2C000%2B-orange?style=flat-square)](nuitka_decompiler.py)
+[![Nuitka](https://img.shields.io/badge/nuitka-1.x%20–%204.0-purple?style=flat-square)](https://nuitka.net)
 [![Status](https://img.shields.io/badge/status-active%20research-brightgreen?style=flat-square)]()
 
 *Analyze authorized Nuitka-compiled Python binaries and extract constants, module metadata, and bytecode artifacts — with a single script.*
@@ -62,6 +63,7 @@ This tool works with:
 - **`.exe` files** compiled with Nuitka (any edition: open-source or commercial)
 - **`.dll` files** compiled with Nuitka — common in modern Nuitka builds where the entry point is packaged as a DLL
 - Both standard Nuitka and Nuitka Commercial (with data-hiding encryption)
+- **Nuitka versions 1.x through 4.0** — including Nuitka Commercial 4.0.6 (verified)
 
 Analysis mode is identical regardless of file type — just pass `--source target.dll` instead of `.exe`.
 
@@ -92,7 +94,7 @@ More examples and the full flag reference: [`docs/usage.md`](docs/usage.md).
 
 ---
 
-## What's new in v7.2
+## What's new in v7.3
 
 ### Update: AI-ready NBC/2 reconstruction bundle
 
@@ -232,7 +234,7 @@ It came from persistence.
 Each small step — extracting one more constant, understanding one more structure, improving the tool slightly — felt like progress in a moment where everything else felt stuck.
 
 Over time, this turned into a serious, multi-year effort.  
-Multiple rewrites, failed attempts, and long nights of trial and error eventually led to what is now version 7.2.
+Multiple rewrites, failed attempts, and long nights of trial and error eventually led to what is now version 7.3.
 
 Today, I'm in a different phase of my life.  
 I'm working towards finishing my studies, building independence, and continuing to grow in the field of reverse engineering and software security — despite everything I was told I wouldn't be able to do.
@@ -262,7 +264,7 @@ If this project helps you, or if you build something on top of it, that means mo
 - **JSON report**: writes a global `REPORT.json` plus per-module outputs.
 - **Optional dynamic mode (Windows)**: DLL injection workflow for controlled lab analysis of owned/authorized processes.
 
-**Compatibility note:** this has **not been tested yet on Nuitka v4 binaries** — format/layout changes may require updates.
+**Compatibility:** tested and verified against **Nuitka 4.0.6** (open-source and Commercial editions). The blob format, constant tag set, CodeObject structure, and `data-hiding` encryption algorithm are all confirmed compatible. Older versions (1.x–3.x) remain supported as before.
 
 ### Research note: Commercial `data-hiding` handling
 

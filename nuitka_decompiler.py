@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NUITKA STATIC UNPACKER - Static-first Nuitka unpacker (authorized research tool) v7.2
+NUITKA STATIC UNPACKER - Static-first Nuitka unpacker (authorized research tool) v7.3
 by dimareverse
 
 Static mode is the default: no runtime hooks, no injection.
 Use only on software you own or are authorized to inspect.
 
 Research focus:
-  1. Nuitka blob formats: headers, named chunks, and constants metadata
+  1. Open-source blob format: CRC32+size header, named chunks, constant recovery
   2. Supported protected metadata layouts for authorized inspection
+     - Mapping tables and digest patterns
+     - Module naming schemes and reconstruction strategies
   3. Module metadata extraction: module hierarchy and binary structure
   4. Code object analysis: function signatures and code metadata
   5. Constant inventory: embedded strings, configuration data, code artifacts
@@ -161,12 +163,12 @@ try:
 {C.BRIGHT_CYAN}   | |\\  | |_| | | |_|   < (_| | | |/ / (_| | || (_) | |   {C.RESET}
 {C.BRIGHT_BLUE}   |_| \\_|\\__,_|_|\\__|_|\\_\\__,_|_|_/___\\__,_|\\__\\___/|_|   {C.RESET}
 
-{C.BOLD}{C.BRIGHT_WHITE}   <<<  Nuitka Static Unpacker v7.2 | by dimareverse  >>>{C.RESET}
+{C.BOLD}{C.BRIGHT_WHITE}   <<<  Nuitka Static Unpacker v7.3 | by dimareverse  >>>{C.RESET}
 {C.BOLD}{C.BRIGHT_WHITE}   <<<  Authorized static analysis | Dynamic lab mode (opt) >>>{C.RESET}
 """
 except Exception:
     BANNER = """
-   Nuitka Static Unpacker v7.2 - by dimareverse
+   Nuitka Static Unpacker v7.3 - by dimareverse
    Authorized static analysis | Dynamic lab mode (optional)
 """
 
@@ -240,11 +242,15 @@ class CommercialBypass:
 
     Use this only for binaries that you own or are authorized to inspect.
 
-    Algorithm summary:
-    - Protected constants metadata can use substitution + counter/XOR feedback
-    - Key material and digest-like byte patterns are searched in PE sections
-    - Candidate combinations are accepted only after CRC validation
-    - Module-name decoding is handled separately where supported
+    Algorithm summary (from DataHidingPlugin.py):
+    - Protected constants metadata uses substitution cipher + XOR with running counter + MD5 digest feedback
+    - Key material: _mapping[] (256 byte inverse subst table) + d0-d7 (8 MD5 digest bytes)
+    - Module names: mapping2 seeded with Random(27), always reconstructible
+
+    Detection: if CRC32 of the payload doesn't match after header, the blob is protected.
+    Key extraction: scan .text/.rdata for _mapping[] (256 byte lookup table) and d0-d7.
+    Strategy v2: try ALL mapping candidates x ALL d0-d7 candidates,
+                 validate each combination with CRC32 before accepting.
     """
 
     def __init__(self):
@@ -291,6 +297,26 @@ class CommercialBypass:
         size_stored = struct.unpack('<I', blob_data[4:8])[0]
         extra = len(blob_data) - 8 - size_stored
         return extra == 16
+
+    def get_blob_layout(self, blob_data: bytes) -> dict:
+        """Return structural metadata for open-source and commercial blobs."""
+        if len(blob_data) < 8:
+            return {
+                'declared_size': 0,
+                'available_payload': 0,
+                'extra_bytes': 0,
+                'has_commercial_digest': False,
+            }
+
+        declared_size = struct.unpack('<I', blob_data[4:8])[0]
+        available_payload = max(0, len(blob_data) - 8)
+        extra_bytes = len(blob_data) - 8 - declared_size
+        return {
+            'declared_size': declared_size,
+            'available_payload': available_payload,
+            'extra_bytes': extra_bytes,
+            'has_commercial_digest': extra_bytes == 16,
+        }
 
     def _decrypt_raw(self, encrypted_blob: bytes, mapping: list, d_values: list,
                       max_bytes: int = 0) -> bytes:
@@ -888,6 +914,8 @@ def extract_pe_constants_blob(pe_path: str) -> bytes:
 
 def _find_embedded_blob(pe) -> bytes:
     """Search for the blob embedded directly in sections (incbin mode)."""
+    encrypted_candidates = []
+
     for section in pe.sections:
         name = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
         sec_data = section.get_data()
@@ -902,6 +930,40 @@ def _find_embedded_blob(pe) -> bytes:
                         blob = sec_data[offset:offset + 8 + potential_size]
                         log_ok(f"Blob found in {name}+0x{offset:X} ({len(blob):,} bytes)")
                         return bytes(blob)
+
+                # Nuitka Commercial data-hiding keeps the 8-byte header clear
+                # and inserts a 16-byte encrypted MD5 digest before the real
+                # payload. The CRC will not match until Phase 3 decrypts it, so
+                # collect these as second-pass candidates instead of discarding.
+                encrypted_total = 8 + 16 + potential_size
+                if offset + encrypted_total <= len(sec_data):
+                    tail = sec_data[offset + encrypted_total:offset + encrypted_total + 32]
+                    score = 0
+                    if offset % 16 == 0:
+                        score += 2
+                    if not tail or all(b == 0 for b in tail[: min(len(tail), 16)]):
+                        score += 3
+                    if offset + encrypted_total >= len(sec_data) - 64:
+                        score += 2
+                    # Prefer realistic Nuitka blobs over accidental integers.
+                    if potential_size > 64 * 1024:
+                        score += 1
+                    encrypted_candidates.append((
+                        score,
+                        name,
+                        offset,
+                        bytes(sec_data[offset:offset + encrypted_total]),
+                    ))
+
+    if encrypted_candidates:
+        encrypted_candidates.sort(key=lambda item: item[0], reverse=True)
+        score, name, offset, blob = encrypted_candidates[0]
+        log_ok(
+            f"Encrypted commercial blob candidate in {name}+0x{offset:X} "
+            f"({len(blob):,} bytes, score={score})"
+        )
+        return blob
+
     return None
 
 
@@ -1215,19 +1277,61 @@ def search_constants_for_source(constants: list, module_name: str, output_dir: s
 # VLQ READER
 # =============================================================================
 
-def read_vlq(data, pos):
-    """Read a VLQ (Variable Length Quantity) integer in Nuitka format."""
-    byte = data[pos]; pos += 1
-    if byte < 0x80: return byte, pos
-    size = byte & 0x7F
-    byte = data[pos]; pos += 1
-    if byte < 0x80: return size | (byte << 7), pos
-    size |= (byte & 0x7F) << 7
-    byte = data[pos]; pos += 1
-    if byte < 0x80: return size | (byte << 14), pos
-    size |= (byte & 0x7F) << 14
-    byte = data[pos]; pos += 1
-    return size | (byte << 21), pos
+_CURRENT_NUITKA_TARGET_PYTHON = sys.version_info[:2]
+_Nuitka_END_OF_STREAM = object()
+_Nuitka_PARSE_ERROR = object()
+
+
+def _normalize_python_version(version):
+    if version is None:
+        return tuple(_CURRENT_NUITKA_TARGET_PYTHON[:2])
+    if isinstance(version, str):
+        m = re.match(r"^\s*(\d+)\.(\d+)", version)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        return tuple(_CURRENT_NUITKA_TARGET_PYTHON[:2])
+    try:
+        return (int(version[0]), int(version[1]))
+    except Exception:
+        return tuple(_CURRENT_NUITKA_TARGET_PYTHON[:2])
+
+
+def set_nuitka_target_python(version):
+    """Set the Python version used for version-dependent Nuitka blob tags."""
+    global _CURRENT_NUITKA_TARGET_PYTHON
+    _CURRENT_NUITKA_TARGET_PYTHON = _normalize_python_version(version)
+
+
+def _target_python_hex(version=None):
+    major, minor = _normalize_python_version(version)
+    # Nuitka represents Python versions as e.g. 0x380, 0x3A0, 0x3B0.
+    return (major << 8) | (minor << 4)
+
+
+def read_vlq(data, pos, *, max_bits=64):
+    """Read Nuitka's variable-length unsigned integer.
+
+    Nuitka's DataComposer encodes uint64_t values using little-endian 7-bit
+    groups. Older versions of this unpacker only consumed up to four bytes,
+    which misaligned chunks containing large blobs or future wider counters.
+    """
+    result = 0
+    shift = 0
+    end = len(data)
+
+    while pos < end:
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+
+        if byte < 0x80:
+            return result, pos
+
+        shift += 7
+        if shift >= max_bits + 7:
+            break
+
+    return result, pos
 
 
 # =============================================================================
@@ -1314,7 +1418,7 @@ def unpack_single_constant(data, pos):
     global _last_unpacked
 
     if pos >= len(data):
-        return None, pos
+        return _Nuitka_PARSE_ERROR, pos
 
     marker = data[pos]
     ch = chr(marker) if 32 <= marker < 127 else None
@@ -1324,6 +1428,9 @@ def unpack_single_constant(data, pos):
     if ch == 'p':
         return _last_unpacked, pos
 
+    if ch == '.':
+        return _Nuitka_END_OF_STREAM, pos
+
     result = _unpack_constant_inner(data, pos, ch, marker)
     if result is not None:
         val, pos = result
@@ -1331,7 +1438,7 @@ def unpack_single_constant(data, pos):
         return val, pos
 
     _last_unpacked = None
-    return None, pos
+    return _Nuitka_PARSE_ERROR, pos
 
 
 def _unpack_constant_inner(data, pos, ch, marker):
@@ -1508,14 +1615,38 @@ def _unpack_constant_inner(data, pos, ch, marker):
         return blob, pos + size
 
     # --- Special types ---
-    elif ch in ('M', 'Q'):  # anon builtin / special value
+    elif ch == 'M':  # anon builtin / type-table value
         if pos < len(data):
-            return f'<builtin_{ch}_{data[pos]}>', pos + 1
-        return None, pos
+            anon_values = {
+                0: '<type NoneType>',
+                1: '<type ellipsis>',
+                2: '<type NotImplementedType>',
+                3: '<type function>',
+                4: '<type generator>',
+                5: '<type builtin_function_or_method>',
+                6: '<type code>',
+                7: '<type module>',
+                8: '<type file>',
+                9: '<type classobj>',
+                10: '<type UnionType>',
+                11: '<type instancemethod>',
+            }
+            return anon_values.get(data[pos], f'<builtin_M_{data[pos]}>'), pos + 1
+        return _Nuitka_PARSE_ERROR, pos
+
+    elif ch == 'Q':  # special singleton/table value
+        if pos < len(data):
+            special_values = {
+                0: Ellipsis,
+                1: NotImplemented,
+                2: '<sys.version_info>',
+            }
+            return special_values.get(data[pos], f'<builtin_Q_{data[pos]}>'), pos + 1
+        return _Nuitka_PARSE_ERROR, pos
 
     elif ch in ('O', 'E'):  # builtin/exception name (null-terminated)
         end = data.find(b'\x00', pos)
-        if end == -1: return None, pos
+        if end == -1: return _Nuitka_PARSE_ERROR, pos
         return data[pos:end].decode('utf-8', errors='replace'), end + 1
 
     elif ch == ':':  # slice(start, stop, step)
@@ -1548,13 +1679,13 @@ def _unpack_constant_inner(data, pos, ch, marker):
         return co_info, pos
 
     elif ch == '.':  # end-of-stream marker
-        return None, pos
+        return _Nuitka_END_OF_STREAM, pos
 
     else:
-        return None, pos
+        return _Nuitka_PARSE_ERROR, pos
 
 
-def _parse_code_object_tag(data, pos):
+def _parse_code_object_tag(data, pos, python_version=None):
     """Parse the 'C' tag (CodeObject skeleton) and return a dict with the info.
 
     Synchronized with DataComposer.py _writeConstantValueCodeObject() and
@@ -1566,6 +1697,7 @@ def _parse_code_object_tag(data, pos):
       [future_spec bits...]
     """
     try:
+        py_hex = _target_python_hex(python_version)
         flags, pos = read_vlq(data, pos)
         flag_base = 1
 
@@ -1587,10 +1719,11 @@ def _parse_code_object_tag(data, pos):
 
         # qualname (Python 3.11+, optional flag)
         qualname = func_name
-        if flags & flag_base:
-            qualname, pos = unpack_single_constant(data, pos)
-            if not isinstance(qualname, str): qualname = func_name
-        flag_base <<= 1
+        if py_hex >= 0x3B0:
+            if flags & flag_base:
+                qualname, pos = unpack_single_constant(data, pos)
+                if not isinstance(qualname, str): qualname = func_name
+            flag_base <<= 1
 
         # free_vars (optional)
         free_vars = ()
@@ -1601,24 +1734,29 @@ def _parse_code_object_tag(data, pos):
 
         # kw_only_count (Python 3.0+, optional)
         kw_only = 0
-        if flags & flag_base:
-            kw_only, pos = read_vlq(data, pos)
-            kw_only += 1
-        flag_base <<= 1
+        if py_hex >= 0x300:
+            if flags & flag_base:
+                kw_only, pos = read_vlq(data, pos)
+                kw_only += 1
+            flag_base <<= 1
 
         # pos_only_count (Python 3.8+, optional)
         pos_only = 0
-        if flags & flag_base:
-            pos_only, pos = read_vlq(data, pos)
-            pos_only += 1
-        flag_base <<= 1
+        if py_hex >= 0x380:
+            if flags & flag_base:
+                pos_only, pos = read_vlq(data, pos)
+                pos_only += 1
+            flag_base <<= 1
 
         # Generator kind: 2 bits
         co_flags = 0
         gen_bits = (flags >> (flag_base.bit_length() - 1)) & 3
-        if gen_bits == 3: co_flags |= 0x200    # CO_ASYNC_GENERATOR
-        elif gen_bits == 2: co_flags |= 0x100  # CO_COROUTINE
-        elif gen_bits == 1: co_flags |= 0x20   # CO_GENERATOR
+        if py_hex >= 0x360 and gen_bits == 3:
+            co_flags |= 0x200    # CO_ASYNC_GENERATOR
+        elif py_hex >= 0x350 and gen_bits == 2:
+            co_flags |= 0x100    # CO_COROUTINE
+        elif gen_bits == 1:
+            co_flags |= 0x20     # CO_GENERATOR
         flag_base <<= 2
 
         # CO_OPTIMIZED
@@ -1669,6 +1807,45 @@ def _parse_code_object_tag(data, pos):
 # BLOB PARSER - Named Chunks
 # =============================================================================
 
+def _is_plausible_blob_module_name(name: str) -> bool:
+    """Validate Nuitka DataComposer chunk names without overfitting."""
+    if name == "":
+        return True
+    if name in (".bytecode", ".files"):
+        return True
+    if len(name) > 4096:
+        return False
+    if any(ord(c) < 32 for c in name):
+        return False
+    # Nuitka module names are usually dotted identifiers, but test suites and
+    # plugin-generated chunks may contain dashes, plus signs, paths, or leading
+    # dots. Keep this permissive while rejecting binary noise.
+    return all(c.isalnum() or c in "._-+/\\:" for c in name)
+
+
+def _decode_blob_module_name(raw_name: bytes, commercial_bypass: CommercialBypass = None) -> str:
+    """Decode a DataComposer chunk name, including commercial mapping2 names."""
+    plain = None
+    try:
+        plain = raw_name.decode('utf-8', errors='strict')
+        if _is_plausible_blob_module_name(plain):
+            return plain
+    except UnicodeDecodeError:
+        pass
+
+    if commercial_bypass:
+        try:
+            decoded = commercial_bypass.decode_module_name(raw_name)
+            if _is_plausible_blob_module_name(decoded):
+                return decoded
+        except Exception:
+            pass
+
+    if plain is not None:
+        return plain
+    return raw_name.decode('utf-8', errors='replace')
+
+
 def parse_blob_modules(blob_data: bytes, commercial_bypass: CommercialBypass = None):
     """Parse the Nuitka constants blob into named modules.
 
@@ -1681,32 +1858,26 @@ def parse_blob_modules(blob_data: bytes, commercial_bypass: CommercialBypass = N
     size_stored = struct.unpack('<I', blob_data[4:8])[0]
     log(f"CRC32: 0x{crc_stored:08X}, Declared size: {size_stored:,} bytes")
 
+    data_end = len(blob_data)
     if 8 + size_stored <= len(blob_data):
-        actual_crc = zlib.crc32(blob_data[8:8 + size_stored]) & 0xFFFFFFFF
+        data_end = 8 + size_stored
+        actual_crc = zlib.crc32(blob_data[8:data_end]) & 0xFFFFFFFF
         if actual_crc == crc_stored:
             log_ok("CRC32 verified OK!")
         else:
             log_warn(f"CRC32 mismatch: expected 0x{crc_stored:08X}, computed 0x{actual_crc:08X}")
 
-    data = blob_data[8:]
+    data = blob_data[8:data_end]
     offset = 0
     modules = []
 
     while offset < len(data) - 5:
-        name_end = data.find(b'\x00', offset, min(offset + 256, len(data)))
+        name_end = data.find(b'\x00', offset, min(offset + 4096, len(data)))
         if name_end == -1:
             break
 
         raw_name = data[offset:name_end]
-
-        # Try decoding name (may be obfuscated with mapping2)
-        try:
-            module_name = raw_name.decode('utf-8', errors='strict')
-        except UnicodeDecodeError:
-            if commercial_bypass:
-                module_name = commercial_bypass.decode_module_name(raw_name)
-            else:
-                module_name = raw_name.decode('utf-8', errors='replace')
+        module_name = _decode_blob_module_name(raw_name, commercial_bypass)
 
         offset = name_end + 1
 
@@ -2111,7 +2282,7 @@ class NuitkaCSourceRebuilder:
         year = datetime.now().year
         out = []
         out.append(f"/* Reconstructed C source for Python module '{module_name}'")
-        out.append(f" * Recovered by Nuitka Static Unpacker v7.2 from compiled binary metadata.")
+        out.append(f" * Recovered by Nuitka Static Unpacker v7.3 from compiled binary metadata.")
         out.append(f" *")
         out.append(f" * Original C was generated by Nuitka but is not stored in the binary.")
         out.append(f" * This reconstruction applies the same Nuitka code-generation templates")
@@ -3002,13 +3173,12 @@ class NuitkaBlobDecoder:
 
     def _decode_count(self, data: memoryview, pos: int, count: int):
         """Decode *count* constants starting at *pos*. Returns (tuple, new_pos)."""
-        items = []
-        for _ in range(count):
-            if pos >= len(data):
-                break
-            v, pos = self._decode_one(data, pos, 0)
-            items.append(v)
-        return tuple(items), pos
+        items, new_pos = _decode_constants_stream(
+            bytes(data),
+            count,
+            start_pos=pos,
+        )
+        return tuple(items), new_pos
 
     def _add_section(self, result: dict, name: str, items: tuple):
         """Add section to result, auto-disambiguating duplicate names."""
@@ -3145,8 +3315,8 @@ class NuitkaBlobDecoder:
                     next_tag in self._VALID_TAGS):
 
                 sec_view = memoryview(bytes(mv[scan_p + 6:scan_p + 6 + s_size]))
-                probe, _ = self._decode_one(sec_view, 0, 0)
-                if probe is not None:
+                items, _ = self._decode_count(sec_view, 0, s_count)
+                if items:
                     discovered_name = "hidden_segment"
                     if scan_p - 1 >= 0 and mv[scan_p - 1] == 0:
                         name_scan = scan_p - 2
@@ -3157,7 +3327,6 @@ class NuitkaBlobDecoder:
                             discovered_name = candidate.decode('ascii', errors='replace')
 
                     name_buf = f"discovered_{discovered_name}_at_{scan_p}"
-                    items, _ = self._decode_count(sec_view, 0, s_count)
                     self._add_section(result, name_buf, items)
                     scan_p += 6 + s_size
                     continue
@@ -3168,9 +3337,8 @@ class NuitkaBlobDecoder:
 
     def decode_at_offset(self, data, offset: int):
         """Decode a single constant starting at a specific byte offset."""
-        mv = memoryview(bytes(data))
-        val, _ = self._decode_one(mv, offset, 0)
-        return val
+        items, _ = _decode_constants_stream(bytes(data), 1, start_pos=offset)
+        return items[0] if items else None
 
 
 # ---------------------------------------------------------------------------
@@ -5844,7 +6012,7 @@ class NuitkaModuleDump:
         if self.blob_offset is not None:
             out.append(f'# Blob offset       : 0x{self.blob_offset:X}')
         out.append(f'# Constants count   : {len(self.constants)}')
-        out.append(f'# Dump produced by  : Nuitka Static Unpacker v7.2 (by dimareverse)')
+        out.append(f'# Dump produced by  : Nuitka Static Unpacker v7.3 (by dimareverse)')
         out.append('')
 
         # ---------- CONSTANTS ----------
@@ -7154,6 +7322,7 @@ class StaticalyExtractor:
                 target_python = sys.version_info[:2]
         self.target_python = tuple(target_python[:2])
         self.target_ver_str = f"{self.target_python[0]}.{self.target_python[1]}"
+        set_nuitka_target_python(self.target_python)
 
     @staticmethod
     def _normalize_decoded_sections(raw_sections):
@@ -7257,7 +7426,7 @@ class StaticalyExtractor:
                 if self.only_modules and not module_matches_patterns(name, self.only_modules):
                     continue
                 try:
-                    items = parse_module_constants(chunk_data)
+                    items = parse_module_constants(chunk_data, python_version=self.target_python)
                 except Exception:
                     items = []
                 section_name = name or '__module_root__'
@@ -8199,7 +8368,7 @@ def _collect_code_objects_recursive(val, module_name, acc):
             _collect_code_objects_recursive(v, module_name, acc)
 
 
-def extract_code_object_map(module_name: str, chunk_data: bytes) -> list:
+def extract_code_object_map(module_name: str, chunk_data: bytes, python_version=None) -> list:
     """Extract code object signatures from a module constants chunk.
 
     Correct approach: parse the chunk normally via `parse_module_constants`,
@@ -8208,7 +8377,7 @@ def extract_code_object_map(module_name: str, chunk_data: bytes) -> list:
     appears inside large integers, byte strings, GenericAlias numeric args, etc.
     """
     try:
-        constants = parse_module_constants(chunk_data)
+        constants = parse_module_constants(chunk_data, python_version=python_version)
     except Exception:
         return []
 
@@ -8234,11 +8403,44 @@ def extract_code_object_map(module_name: str, chunk_data: bytes) -> list:
 # PER-MODULE CONSTANTS PARSER
 # =============================================================================
 
-def parse_module_constants(chunk_data: bytes) -> list:
-    """Parse all constants in a module chunk."""
+def _decode_constants_stream(stream_data: bytes, count: int, *, python_version=None,
+                             start_pos: int = 0) -> tuple:
+    """Decode *count* constants from a raw constants stream.
+
+    This is the stateful core used by both normal chunks and aggressive scans.
+    The `'p'` previous-value marker is stream-local in Nuitka, so resetting it
+    here avoids cross-module contamination and keeps `None` constants intact.
+    """
     global _last_unpacked
     _last_unpacked = None
+    old_target = _CURRENT_NUITKA_TARGET_PYTHON
+    set_nuitka_target_python(python_version or old_target)
 
+    constants = []
+    pos = start_pos
+
+    try:
+        for _ in range(count):
+            if pos >= len(stream_data):
+                break
+            val, new_pos = unpack_single_constant(stream_data, pos)
+            if new_pos <= pos:
+                break
+            pos = new_pos
+            if val is _Nuitka_END_OF_STREAM:
+                break
+            if val is _Nuitka_PARSE_ERROR:
+                break
+            constants.append(val)
+    finally:
+        _last_unpacked = None
+        set_nuitka_target_python(old_target)
+
+    return constants, pos
+
+
+def parse_module_constants(chunk_data: bytes, python_version=None) -> list:
+    """Parse all constants in a module chunk."""
     if len(chunk_data) < 2:
         return []
 
@@ -8250,19 +8452,12 @@ def parse_module_constants(chunk_data: bytes) -> list:
     if count == 0 or count > 50000:
         return []
 
-    constants = []
-    pos = 2
-
-    for _ in range(count):
-        if pos >= len(chunk_data):
-            break
-        try:
-            val, pos = unpack_single_constant(chunk_data, pos)
-            if val is not None:
-                constants.append(val)
-        except Exception:
-            break
-
+    constants, _pos = _decode_constants_stream(
+        chunk_data,
+        count,
+        python_version=python_version,
+        start_pos=2,
+    )
     return constants
 
 
@@ -8941,6 +9136,7 @@ class NuitkalizatorPro:
         log(f"Size: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
 
         py_ver = detect_python_version_from_pe(pe_data)
+        set_nuitka_target_python(py_ver)
         self.report['python_version'] = f"{py_ver[0]}.{py_ver[1]}"
         log_ok(f"Python version: {py_ver[0]}.{py_ver[1]}")
 
@@ -9218,12 +9414,12 @@ class NuitkalizatorPro:
             if self.main_only and not is_main:
                 continue
 
-            constants = parse_module_constants(chunk_data)
-            # Search constants for embedded source-like strings.
+            constants = parse_module_constants(chunk_data, python_version=py_ver)
+            # Search constants for embedded Python source (crackme-style hidden source)
             const_src = search_constants_for_source(constants, module_name, self.output_dir)
             if const_src:
                 all_const_source_findings.extend(const_src)
-            code_objs = extract_code_object_map(module_name, chunk_data)
+            code_objs = extract_code_object_map(module_name, chunk_data, python_version=py_ver)
             all_code_objects.extend(code_objs)
             secrets = scan_for_secrets(constants, module_name)
             all_secrets.extend(secrets)
@@ -9478,8 +9674,8 @@ class NuitkalizatorPro:
         for module_name, chunk_data in analysis_module_chunks:
             c_pb.update()
             try:
-                constants = parse_module_constants(chunk_data)
-                code_objs = extract_code_object_map(module_name, chunk_data)
+                constants = parse_module_constants(chunk_data, python_version=py_ver)
+                code_objs = extract_code_object_map(module_name, chunk_data, python_version=py_ver)
 
                 mt_entry = mt_by_name.get(module_name)
                 native_addr = mt_entry['func_ptr'] if mt_entry else None
