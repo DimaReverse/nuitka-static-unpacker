@@ -8,7 +8,7 @@
 |_| \_|\__,_|_|\__|_|\_\__,_|_|_/___\__,_|\__\___/|_|   
 ```
 
-**Nuitka Static Unpacker · Nuitka Commercial “data-hiding” research · Pure Python**
+**Nuitka Static Unpacker · Nuitka Commercial "data-hiding" research · Pure Python**
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
@@ -23,7 +23,7 @@
 
 ## What is this?
 
-**Nuitka Static Unpacker** is a *static-first* analysis tool for Python binaries compiled with [Nuitka](https://nuitka.net/). It extracts constants, module structures, code object metadata, and `.pyc` files from **open-source** Nuitka builds — and includes a research-grade implementation that can *attempt* to decrypt the constants blob used by Nuitka Commercial’s `data-hiding` plugin (when present).
+**Nuitka Static Unpacker** is a *static-first* analysis tool for Python binaries compiled with [Nuitka](https://nuitka.net/). It extracts constants, module structures, code object metadata, and `.pyc` files from **open-source** Nuitka builds — and includes a research-grade implementation that can *attempt* to decrypt the constants blob used by Nuitka Commercial's `data-hiding` plugin (when present).
 
 It can also optionally switch to a **dynamic mode** via DLL injection to capture live Python source at runtime.
 
@@ -44,8 +44,12 @@ It can also optionally switch to a **dynamic mode** via DLL injection to capture
 
 ### Important (onefile targets)
 
-If your target is a **Nuitka onefile** executable, you often need to **extract the embedded files first** (embedded `.exe` / `.pyd` / `.dll` payloads).  
-Use [Extreme Coder’s `nuitka-extractor`](https://github.com/extremecoders-re/nuitka-extractor) to unpack the onefile, then run this tool on the extracted binary.
+If your target is a **Nuitka onefile** executable, you need to **extract the embedded payload first** before running this tool. Two options depending on the outer protection layer:
+
+| Outer protection | Extraction tool |
+|---|---|
+| Plain Nuitka onefile (no packer) | [nuitka-extractor](https://github.com/extremecoders-re/nuitka-extractor) |
+| **Themida / WinLicense** + Nuitka onefile | [nuitka-themida-unpacker](https://github.com/DimaReverse/nuitka-themida-unpacker) ← companion repo |
 
 If you skip this step, you may hit:
 
@@ -65,6 +69,41 @@ More examples and the full flag reference: [`docs/usage.md`](docs/usage.md).
 
 ---
 
+## What's new in v7.2
+
+- **`list_modules.py`** — standalone script: lists every module inside a binary in ~1 second, zero decompilation, zero output files
+- **`--list-modules` flag** — same functionality directly inside `nuitka_decompiler.py`
+- **`--filter STR`** — narrow the module list to names containing a string
+- **`--copy-cmd`** — prints a ready-to-paste `--only` command at the end
+
+### Workflow: pick only the .nbc files you want
+
+Instead of waiting for the full pipeline to process every module, you can now inspect the module list first and decompile only what you actually need:
+
+```bash
+# Step 1 — list all modules in ~1 second
+python list_modules.py target.exe
+
+# Step 2 — filter by name
+python list_modules.py target.exe --filter crypto
+
+# Step 3 — get a ready-to-paste command
+python list_modules.py target.exe --filter crypto --copy-cmd
+# Output:  python nuitka_decompiler.py --source target.exe --only crypto,crypto.utils
+
+# Step 4 — decompile only those modules, skip everything else
+python nuitka_decompiler.py --source target.exe --only crypto,crypto.utils
+```
+
+Or without the separate script, directly inside the main tool:
+
+```bash
+python nuitka_decompiler.py --source target.exe --list-modules
+python nuitka_decompiler.py --source target.exe --list-modules --filter config
+```
+
+---
+
 ## Documentation
 
 - [`docs/usage.md`](docs/usage.md) — CLI flags, examples, troubleshooting
@@ -72,25 +111,27 @@ More examples and the full flag reference: [`docs/usage.md`](docs/usage.md).
 - [`docs/nuitka_blob_format.md`](docs/nuitka_blob_format.md) — constants blob format notes
 - [`docs/roadmap.md`](docs/roadmap.md) — roadmap / known gaps
 
+---
+
 ## The story behind this project
 
 I started building this project in 2023, during one of the hardest periods of my life.
 
 At the time, I was dealing with severe isolation and a constant feeling of being misunderstood. I had been diagnosed on the autism spectrum, but instead of receiving support that matched my actual abilities, I was often treated as if I were incapable.
 
-I was pushed into programs designed for people with significantly different needs than mine, placed in environments where I didn’t belong, and repeatedly told — directly and indirectly — that I wouldn’t be able to work, live independently, or even get a driver’s license.
+I was pushed into programs designed for people with significantly different needs than mine, placed in environments where I didn't belong, and repeatedly told — directly and indirectly — that I wouldn't be able to work, live independently, or even get a driver's license.
 
-On top of that, I had to deal with ongoing medical and administrative processes (including support/guardianship-style arrangements) that left me feeling like pieces of my autonomy were being taken away day by day — through pressure, conditional “help”, and situations where saying “no” didn’t feel like a real option.
+On top of that, I had to deal with ongoing medical and administrative processes (including support/guardianship-style arrangements) that left me feeling like pieces of my autonomy were being taken away day by day — through pressure, conditional "help", and situations where saying "no" didn't feel like a real option.
 
-At school, things weren’t better. I experienced heavy and persistent bullying, to the point where attending classes became extremely difficult. Over time, I stopped going regularly and was no longer able to complete my final year in the standard way.
+At school, things weren't better. I experienced heavy and persistent bullying, to the point where attending classes became extremely difficult. Over time, I stopped going regularly and was no longer able to complete my final year in the standard way.
 
 Outside of school, my social life almost disappeared. I lost most of my friends and spent long periods of time alone. Many nights were spent online, playing games with older people simply because they treated me with more respect than people my own age.
 
-During that time, I didn’t have much — but I had a computer and an internet connection.
+During that time, I didn't have much — but I had a computer and an internet connection.
 
 I started diving deep into how software works internally. What began as curiosity turned into an obsession: reading PE formats, analyzing compiled binaries, experimenting with reverse engineering, and slowly understanding how Nuitka transforms Python code into something that looks almost unreadable.
 
-This project didn’t come from a structured plan.  
+This project didn't come from a structured plan.  
 It came from persistence.
 
 Each small step — extracting one more constant, understanding one more structure, improving the tool slightly — felt like progress in a moment where everything else felt stuck.
@@ -98,12 +139,12 @@ Each small step — extracting one more constant, understanding one more structu
 Over time, this turned into a serious, multi-year effort.  
 Multiple rewrites, failed attempts, and long nights of trial and error eventually led to what is now version 7.2.
 
-Today, I’m in a different phase of my life.  
-I’m working towards finishing my studies, building independence, and continuing to grow in the field of reverse engineering and software security — despite everything I was told I wouldn’t be able to do.
+Today, I'm in a different phase of my life.  
+I'm working towards finishing my studies, building independence, and continuing to grow in the field of reverse engineering and software security — despite everything I was told I wouldn't be able to do.
 
 Open-sourcing this project is part of that process.
 
-It’s a way to share something real that came out of a difficult period, and to connect with people who are interested in understanding how software truly works under the surface.
+It's a way to share something real that came out of a difficult period, and to connect with people who are interested in understanding how software truly works under the surface.
 
 If this project helps you, or if you build something on top of it, that means more than you might think.
 
@@ -117,6 +158,7 @@ If this project helps you, or if you build something on top of it, that means mo
 - **Static-first analysis**: PE parsing, Python version detection, constants/blob discovery and decoding.
 - **Commercial `data-hiding` support (static)**: includes a research implementation that can attempt to recover key material from the binary and decrypt the constants blob (when present), then parse it normally.
 - **Module table parsing**: recovers module list/metadata from PE sections when available.
+- **Fast module listing**: `list_modules.py` / `--list-modules` — see all module names in ~1 second without running the full pipeline.
 - **`.pyc` extraction**: recovers bytecode and writes per-module artifacts.
 - **Code object map**: function signatures / args / line metadata (where recoverable).
 - **Secrets scanner**: finds likely passwords/keys/URLs in extracted constants.
@@ -137,6 +179,15 @@ The tool locates both tables in the PE's `.text`/`.rdata` sections, tries all va
 
 ---
 
+## Companion repos
+
+| Repo | What it does |
+|---|---|
+| [nuitka-themida-unpacker](https://github.com/DimaReverse/nuitka-themida-unpacker) | Full pipeline for targets protected with **Themida/WinLicense + Nuitka onefile**: strips the packer layer, extracts the embedded payload, feeds it here |
+| [nuitka-extractor](https://github.com/extremecoders-re/nuitka-extractor) | Unpacks plain Nuitka onefile executables (no Themida) |
+
+---
+
 ## Supported decompiler backends
 
 The tool tries these in order, falling back gracefully:
@@ -154,8 +205,8 @@ The tool tries these in order, falling back gracefully:
 ## Installation
 
 ```bash
-git clone https://github.com/<your-user>/nuitka-decompiler.git
-cd nuitka-decompiler
+git clone https://github.com/DimaReverse/nuitka-static-unpacker.git
+cd nuitka-static-unpacker
 pip install -r requirements.txt
 ```
 
@@ -164,9 +215,6 @@ Optional: install external decompiler backends for best results:
 pip install uncompyle6 decompyle3 decompile3
 # For pycdc/pycdas: build from source or grab a release from https://github.com/zrax/pycdc
 ```
-
-Related tool (embedded extraction):
-- [Extreme Coder’s `nuitka-extractor`](https://github.com/extremecoders-re/nuitka-extractor) — useful for **onefile** builds to extract embedded files (e.g. `.exe`, `.pyd`, `.dll`) from the main executable before deeper analysis.
 
 ---
 
@@ -190,7 +238,14 @@ python nuitka_decompiler.py --source target.exe --all
 python nuitka_decompiler.py --source target.exe --output ./unpacked
 ```
 
-### Restrict to specific modules
+### List all modules without decompiling anything
+
+```bash
+python list_modules.py target.exe
+python list_modules.py target.exe --filter myapp --copy-cmd
+```
+
+### Restrict to specific modules (fast)
 
 ```bash
 python nuitka_decompiler.py --source target.exe --only mypackage,mypackage.utils
@@ -225,10 +280,11 @@ output/
 
 ### Important note about extracted `.pyc`
 
-In many real-world Nuitka builds, **most extracted `.pyc` files are bundled libraries / stdlib modules**, not the application’s “interesting” code. This is normal.
+In many real-world Nuitka builds, **most extracted `.pyc` files are bundled libraries / stdlib modules**, not the application's "interesting" code. This is normal.
 
 Tips:
-- Use `REPORT.json` and the per-module `constants.json` / `code_objects.json` to quickly locate the app’s own modules.
+- Use `list_modules.py` first to get an overview before committing to a full run.
+- Use `REPORT.json` and the per-module `constants.json` / `code_objects.json` to quickly locate the app's own modules.
 - If you already know the package name, run with `--only myapp,myapp.*` to focus the pipeline and avoid drowning in library output.
 
 ---
@@ -295,7 +351,7 @@ This tool is intended for:
 
 **Do not use it on software you do not have authorization to analyze.** Respect licenses and applicable law.
 
-This repository is published for legitimate reverse engineering, interoperability research, malware analysis, and defensive security work — **not** for piracy, stalking competitors, or bypassing licenses. If you’re unsure whether your use is permitted, don’t run it.
+This repository is published for legitimate reverse engineering, interoperability research, malware analysis, and defensive security work — **not** for piracy, stalking competitors, or bypassing licenses. If you're unsure whether your use is permitted, don't run it.
 
 ---
 
