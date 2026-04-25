@@ -4235,6 +4235,9 @@ class NuitkaStaticDisassembler:
         # Pre-compute useful lookups
         self._iat = self._build_iat_map()
         self._section_map = self._build_section_map()
+        self._section_data_cache = {}
+        self._analysis_cache = {}
+        self._analysis_cache_lock = threading.Lock()
         # Map func_ptr -> module_name from the loader table
         self._func_to_module = {e['func_ptr']: e['name']
                                 for e in self.module_table
@@ -4369,7 +4372,11 @@ class NuitkaStaticDisassembler:
         name, section, offset = self._find_section_for_rva(rva)
         if section is None:
             return []
-        sec_data = section.get_data()
+        cache_key = (section.VirtualAddress, section.SizeOfRawData)
+        sec_data = self._section_data_cache.get(cache_key)
+        if sec_data is None:
+            sec_data = section.get_data()
+            self._section_data_cache[cache_key] = sec_data
         code = sec_data[offset:offset + max_bytes]
         instructions = []
         for ins in self.md.disasm(code, func_ptr):
@@ -4392,6 +4399,12 @@ class NuitkaStaticDisassembler:
               'reached_ret': True/False
             }
         """
+        cache_key = (func_ptr, max_bytes)
+        with self._analysis_cache_lock:
+            cached = self._analysis_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         instructions = self.disassemble_function(func_ptr, max_bytes=max_bytes)
         calls = []
         const_loads = []
@@ -4482,7 +4495,7 @@ class NuitkaStaticDisassembler:
                 pending_fp = fp_va
                 pending_fp_hint_index = len(make_function_hints) - 1
 
-        return {
+        result = {
             'func_va': func_ptr,
             'instruction_count': len(instructions),
             'reached_ret': bool(instructions and instructions[-1].mnemonic == 'ret'),
@@ -4492,6 +4505,9 @@ class NuitkaStaticDisassembler:
             'make_function_hints': make_function_hints,
             'raw_disasm': raw,
         }
+        with self._analysis_cache_lock:
+            self._analysis_cache[cache_key] = result
+        return result
 
     @staticmethod
     def _looks_like_function_entry(info):
@@ -4569,8 +4585,8 @@ class NuitkaStaticDisassembler:
         from collections import OrderedDict, deque
         runtime_aliases = runtime_aliases or {}
 
-        # Skip ANY ranked helper (top-100 by call frequency across the
-        # whole binary). These are shared runtime helpers that every
+        # Skip ranked helpers found by the call-frequency prepass. These
+        # are shared runtime helpers that every
         # module ends up calling — disassembling them per-module would
         # duplicate the same ops in every .nbc and waste LLM context.
         helper_vas = {va for va, alias in runtime_aliases.items()
@@ -4698,17 +4714,24 @@ class NuitkaStaticDisassembler:
         # Ranking accuracy is unaffected — we only need relative
         # frequency, not exhaustive disassembly.
         for e in targets:
-            info = self.analyse_function(e['func_ptr'], max_bytes=8192)
+            try:
+                info = self.analyse_function(e['func_ptr'], max_bytes=8192)
+            except Exception:
+                continue
             for c in info['calls']:
                 if c['kind'] == 'internal':
                     counter[c['target']] += 1
-        # Rank-based aliasing
+        # Rank-based aliasing. Hot targets shared by many module entries are
+        # runtime helpers; one-off targets are kept as fn_0x... so the BFS
+        # can still chase real local code instead of over-skipping it.
         alias_map = {}
+        sample_count = max(len(targets), 1)
+        helper_min_count = max(2, sample_count // 25)
         for rank, (va, count) in enumerate(counter.most_common()):
             # First few are the hottest runtime helpers
             if rank < 20:
                 alias_map[va] = f'RUNTIME_HELPER_{rank:02d}_x{va & 0xFFFF:04x}'
-            elif rank < 100:
+            elif count >= helper_min_count:
                 alias_map[va] = f'helper_{rank:03d}_0x{va:X}'
             else:
                 alias_map[va] = f'fn_0x{va:X}'
@@ -4994,6 +5017,55 @@ class NuitkaCompactEmitter:
         tuple:       'T', list:       'L',
         dict:        'D', set:        'S', frozenset: 'P',
     }
+    _QUALNAME_RE = re.compile(
+        r'(?:[A-Za-z_][A-Za-z0-9_]*|<[^>\s]+>)'
+        r'(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|<[^>\s]+>))*'
+    )
+    _COMMON_NON_QUALNAMES = {
+        'none', 'true', 'false', 'self', 'args', 'kwargs', 'main',
+        'init', 'call', 'test', 'name', 'file', 'path', 'data',
+        'json', 'text', 'open', 'read', 'write',
+    }
+
+    @classmethod
+    def _qualname_score(cls, value, *, allow_short=False):
+        """Score strings that look like Python function/class qualnames."""
+        if not isinstance(value, str):
+            return 0
+        if not (2 <= len(value) <= 200):
+            return 0
+        if any(ch in value for ch in (' ', '\n', '\r', '/', '\\')):
+            return 0
+        if value.startswith('__') and value.endswith('__'):
+            return 0
+        if not cls._QUALNAME_RE.fullmatch(value):
+            return 0
+        low = value.lower()
+        if low in cls._COMMON_NON_QUALNAMES:
+            return 0
+        if value.isupper():
+            return 0
+
+        tail = value.rsplit('.', 1)[-1]
+        tail_plain = tail[1:-1] if tail.startswith('<') and tail.endswith('>') else tail
+        if not allow_short and '.' not in value and '<' not in value:
+            if not (value.startswith('_') and len(value) >= 4) and len(value) < 8:
+                return 0
+
+        score = 1
+        if '<' in value:
+            score += 6
+        if '.' in value:
+            score += 5
+        if value.startswith('_') and len(value) >= 4:
+            score += 2
+        if len(tail_plain) >= 5 and not tail_plain.isupper():
+            score += 2
+        if allow_short and len(tail_plain) >= 3 and not tail_plain.isupper():
+            score += 1
+        if value[:1].isupper() and '.' not in value:
+            score -= 2
+        return max(score, 0)
 
     @classmethod
     def _type_code(cls, v):
@@ -5168,6 +5240,16 @@ class NuitkaCompactEmitter:
                 return idx, constants[idx]
             return None
 
+        important_mnems = {
+            'cmp', 'test', 'ret', 'call', 'callq',
+            'jmp', 'je', 'jne', 'ja', 'jae', 'jb', 'jbe', 'jg', 'jge',
+            'jl', 'jle', 'jo', 'jno', 'js', 'jns',
+            'add', 'sub', 'imul', 'mul', 'idiv', 'div', 'neg', 'not',
+            'and', 'or', 'xor', 'shl', 'shr', 'sar', 'seta', 'setae',
+            'setb', 'setbe', 'sete', 'setne', 'setg', 'setge', 'setl',
+            'setle',
+        }
+        omitted = 0
         for va, mnem, ops in disasm_info.get('raw_disasm', []):
             comments = []
             if va in const_by_va:
@@ -5195,10 +5277,16 @@ class NuitkaCompactEmitter:
                 else:
                     comments.append(str(c.get('kind')))
 
+            if not comments and mnem not in important_mnems:
+                omitted += 1
+                continue
+
             line = f'  0x{va:X}: {mnem:<8} {ops}'
             if comments:
                 line += '  ; ' + ' ; '.join(comments)
             out.append(line)
+        if omitted:
+            out.append(f'  # omitted {omitted} low-signal native instruction(s)')
         out.append('')
 
     @classmethod
@@ -5261,13 +5349,21 @@ class NuitkaCompactEmitter:
         if not inferred:
             return
         out.append('@FUNCS_DETECTED')
-        for fn in inferred[:60]:
+        emitted = 0
+        max_funcs = 300
+        for fn in inferred:
+            if emitted >= max_funcs:
+                break
             name = fn.get('name', '')
             if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name or ''):
                 continue
             args = fn.get('args') or []
             args_str = ', '.join(str(a) for a in args)
             out.append(f"  {name}({args_str})")
+            emitted += 1
+        if len(inferred) > emitted:
+            out.append(f"  # ... {len(inferred) - emitted} more inferred "
+                       f"signature candidate(s) omitted")
 
     @classmethod
     def _emit_forensics(cls, constants, va_to_qualname, out):
@@ -5317,22 +5413,9 @@ class NuitkaCompactEmitter:
         # Collect all qualname-shaped strings in @CONSTS, with their
         # indices. A qualname looks like `foo`, `Foo.bar`,
         # `mod.Foo.bar.<locals>.baz`, `<lambda>`, `<genexpr>`.
-        qualname_pat = re.compile(
-            r'[A-Za-z_][A-Za-z0-9_]*'
-            r'(\.[A-Za-z_<][A-Za-z0-9_<>.]*)*'
-        )
         all_qualnames = {}   # qualname -> first index in mod_consts
         for i, v in enumerate(constants):
-            if not isinstance(v, str) or len(v) < 2 or len(v) > 200:
-                continue
-            # Exclude obvious non-qualnames early
-            if ' ' in v or '\n' in v or '/' in v or '\\' in v:
-                continue
-            if v.startswith('__') and v.endswith('__'):
-                continue  # dunder (e.g. __main__, __init__) would spam
-            if v.isupper():
-                continue  # ALL_CAPS is almost certainly an enum/const, not a func
-            if not qualname_pat.fullmatch(v):
+            if cls._qualname_score(v, allow_short=False) <= 0:
                 continue
             # Python-function naming heuristics — reject anything too
             # generic to plausibly be a function qualname:
@@ -5342,11 +5425,6 @@ class NuitkaCompactEmitter:
             #   * len >= 8 + lowercase              -> long identifier,
             #                                          likely a function
             #   * otherwise (short word like 'foo') -> reject
-            is_dotted = '.' in v or '<' in v
-            is_private = v.startswith('_') and len(v) >= 4
-            is_long = len(v) >= 8 and not v[0].isupper()
-            if not (is_dotted or is_private or is_long):
-                continue
             if v not in all_qualnames:
                 all_qualnames[v] = i
 
@@ -5531,18 +5609,21 @@ class NuitkaCompactEmitter:
         # Build a label map for jump targets first
         label_map = {}   # VA -> label id
         ops_raw = []     # ( kind, data, va )
-        last_cmp_const_idx = None
+        recent_const = None
+        pending_cmp_const_idx = None
 
         for va, mnem, ops in disasm_info['raw_disasm']:
             if va in const_by_va:
                 idx = resolve_const(const_by_va[va]['target_va'])
                 if idx is not None:
                     ops_raw.append(('L', idx, va))
-                    last_cmp_const_idx = idx
+                    recent_const = (idx, va)
                 else:
                     # load is to a global / cache outside mod_consts
                     continue
             elif va in call_by_va:
+                pending_cmp_const_idx = None
+                recent_const = None
                 c = call_by_va[va]
                 if c['kind'] == 'capi':
                     ops_raw.append(('C', f'capi:{c["name"]}', va))
@@ -5553,8 +5634,13 @@ class NuitkaCompactEmitter:
                     else:
                         alias = runtime_aliases.get(c['target'])
                         if alias and alias.startswith('RUNTIME_HELPER_'):
-                            rank = alias.split('_')[2]
+                            try:
+                                rank = str(int(alias.split('_')[2]))
+                            except Exception:
+                                rank = alias.split('_')[2]
                             ops_raw.append(('C', f'r#{rank}', va))
+                        elif alias and alias.startswith('helper_'):
+                            ops_raw.append(('C', alias, va))
                         else:
                             tgt_va = c['target']
                             ops_raw.append(('C', f'fn@0x{tgt_va:X}', va))
@@ -5562,19 +5648,24 @@ class NuitkaCompactEmitter:
                 # Often precedes a conditional jump; record the immediate
                 # operand if it's a register vs numeric imm or vs [rip+X]
                 # (already resolved above).
-                pass
+                if recent_const and va - recent_const[1] <= 96:
+                    pending_cmp_const_idx = recent_const[0]
+                else:
+                    pending_cmp_const_idx = None
+            elif mnem == 'test':
+                pending_cmp_const_idx = None
             elif mnem == 'je' or mnem == 'jne':
                 # extract the jump target
                 try:
                     target = int(ops.split()[-1], 0)
                     label_map.setdefault(target, len(label_map) + 1)
-                    if last_cmp_const_idx is not None:
+                    if pending_cmp_const_idx is not None:
                         ops_raw.append(('J_EQ' if mnem == 'je' else 'J_NE',
-                                        (last_cmp_const_idx, target), va))
+                                        (pending_cmp_const_idx, target), va))
                     else:
                         ops_raw.append(('J_EQ' if mnem == 'je' else 'J_NE',
                                         (None, target), va))
-                    last_cmp_const_idx = None
+                    pending_cmp_const_idx = None
                 except Exception:
                     pass
             elif mnem == 'jmp':
@@ -5641,10 +5732,6 @@ class NuitkaCompactEmitter:
         # to qualnames and never appear in the random string literals
         # the function happens to pass around. Only fall back to
         # single-word identifiers if no strong candidate exists.
-        qualname_pat = re.compile(
-            r'[A-Za-z_][A-Za-z0-9_]*'
-            r'(\.[A-Za-z_<][A-Za-z0-9_<>.]*)*'
-        )
         strong = []      # dotted / angle-bracketed qualnames
         weak = []        # bare identifiers (less confident)
         seen_strs = set()
@@ -5664,9 +5751,7 @@ class NuitkaCompactEmitter:
             if not isinstance(v, str) or v in seen_strs:
                 continue
             seen_strs.add(v)
-            if len(v) < 2 or len(v) > 120:
-                continue
-            if not qualname_pat.fullmatch(v):
+            if cls._qualname_score(v, allow_short=True) <= 0:
                 continue
             # Strong candidates have a dot or an angle bracket —
             # unambiguously a qualname.
@@ -5675,7 +5760,7 @@ class NuitkaCompactEmitter:
             else:
                 # Skip all-uppercase short bare names (more likely
                 # dict keys / enum constants than function qualnames).
-                if len(v) >= 5 and not v.isupper():
+                if len(v) >= 3 and not v.isupper():
                     weak.append(v)
         # Prefer the FIRST strong candidate — that's the load Nuitka
         # emits for `__qualname__`. Fall back to the first weak one
@@ -5751,13 +5836,9 @@ class NuitkaCompactEmitter:
             # child. The child itself has no __qualname__ const load.
             va_to_qualname = {}
             if mod_consts_base is not None:
-                import re as _re
-                qualname_pat = _re.compile(
-                    r'[A-Za-z_][A-Za-z0-9_]*'
-                    r'(\.[A-Za-z_<][A-Za-z0-9_<>.]*)*'
-                )
-
                 def _resolve_const_str(va):
+                    if va is None:
+                        return None
                     if va < mod_consts_base:
                         return None
                     off = va - mod_consts_base
@@ -5767,9 +5848,7 @@ class NuitkaCompactEmitter:
                     if not (0 <= i < len(constants)):
                         return None
                     v = constants[i]
-                    if not isinstance(v, str):
-                        return None
-                    if len(v) < 2 or len(v) > 120:
+                    if cls._qualname_score(v, allow_short=True) <= 0:
                         return None
                     return v
 
@@ -5783,31 +5862,33 @@ class NuitkaCompactEmitter:
                 # `ClassName.method` / `func` / `<lambda>` etc.
                 for _va, _info in infos_dict.items():
                     # Precompute this parent's string candidates once
-                    parent_strs = []
+                    const_events = []
                     for cl in _info.get('const_loads', []):
                         s = _resolve_const_str(cl['target_va'])
                         if s is None:
                             continue
-                        parent_strs.append(s)
-                    if not parent_strs:
+                        const_events.append((
+                            cl.get('va_from', 0),
+                            cls._qualname_score(s, allow_short=True),
+                            s,
+                        ))
+                    if not const_events:
                         continue
-                    # Prefer candidates with dot / angle brackets
-                    # (unambiguously qualnames); fall back to plain
-                    # identifiers for top-level functions.
-                    strong = [s for s in parent_strs
-                              if ('.' in s or '<' in s) and qualname_pat.fullmatch(s)]
-                    weak = [s for s in parent_strs
-                            if qualname_pat.fullmatch(s) and s not in strong
-                            and len(s) >= 3 and not s.isupper()]
-                    if not (strong or weak):
-                        continue
-                    pick = strong[0] if strong else weak[0]
-                    # Attach to EVERY func_ptr_load target of this
-                    # parent that doesn't already have a label.
+                    # Pair each function pointer with the nearest
+                    # qualname-like constant load in the same call site.
                     for fp in _info.get('func_ptr_loads', []):
-                        tgt = fp['target_va']
-                        if tgt not in va_to_qualname:
-                            va_to_qualname[tgt] = pick
+                        fp_site = fp.get('va_from', 0)
+                        tgt = fp.get('target_va')
+                        if tgt is None:
+                            continue
+                        nearby = []
+                        for c_site, score, s in const_events:
+                            dist = abs(c_site - fp_site)
+                            if dist <= 192:
+                                nearby.append((-score, dist, c_site > fp_site, s))
+                        if nearby and tgt not in va_to_qualname:
+                            nearby.sort()
+                            va_to_qualname[tgt] = nearby[0][3]
                     # Also keep the previous adjacency logic for
                     # parents that have MULTIPLE (lea, qualname) pairs
                     # — try to pair each specifically
@@ -5815,12 +5896,11 @@ class NuitkaCompactEmitter:
                         target_fn_va = hint['func_va']
                         for cand in hint.get('candidate_vas', []):
                             s = _resolve_const_str(cand)
-                            if s is not None and qualname_pat.fullmatch(s):
+                            if s is not None:
                                 # Override weak picks with specific
                                 # adjacency-derived qualname
-                                if ('.' in s or '<' in s):
-                                    va_to_qualname[target_fn_va] = s
-                                elif target_fn_va not in va_to_qualname:
+                                if ('.' in s or '<' in s
+                                        or target_fn_va not in va_to_qualname):
                                     va_to_qualname[target_fn_va] = s
                                 break
 
@@ -7303,10 +7383,12 @@ class StaticalyExtractor:
         result = ext.run(output_dir="OUT")
     """
 
-    def __init__(self, blob_data, target_python=None, pe_file=None, module_table=None):
+    def __init__(self, blob_data, target_python=None, pe_file=None,
+                 module_table=None, nbc_only=False):
         self.blob = blob_data
         self.pe = pe_file                 # optional pefile.PE for disassembly
         self.module_table = module_table or []
+        self.nbc_only = nbc_only
         # Optional `--only` filter (list of names or `pkg.*` globs).
         # Set by NuitkalizatorPro after construction. When None, the
         # pipeline disassembles every compiled entry in the table.
@@ -7679,20 +7761,21 @@ class StaticalyExtractor:
                                      and 'EXTENSION' not in e.get('flag_names', [])
                                      for e in self.module_table)
                     _reason = None if _in_table else 'not_in_module_table'
-                try:
-                    nbc_text = NuitkaCompactEmitter.render(
-                        module_name=name,
-                        constants=items_list,
-                        python_version=self.target_python,
-                        ops_absence_reason=_reason,
-                        module_table_entry=mt_by_name.get(name),
-                        chunk_bytes=chunk_raw_bytes.get(name),
-                    )
-                    nbc_path = dest.with_suffix('.nbc')
-                    nbc_path.write_text(nbc_text, encoding='utf-8')
-                    dump_written += 1
-                except Exception:
-                    pass
+                if _reason is not None:
+                    try:
+                        nbc_text = NuitkaCompactEmitter.render(
+                            module_name=name,
+                            constants=items_list,
+                            python_version=self.target_python,
+                            ops_absence_reason=_reason,
+                            module_table_entry=mt_by_name.get(name),
+                            chunk_bytes=chunk_raw_bytes.get(name),
+                        )
+                        nbc_path = dest.with_suffix('.nbc')
+                        nbc_path.write_text(nbc_text, encoding='utf-8')
+                        dump_written += 1
+                    except Exception:
+                        pass
 
                 # Stats for the manifest
                 try:
@@ -7722,6 +7805,79 @@ class StaticalyExtractor:
         except Exception:
             pass
 
+        return written
+
+    def emit_nbc_placeholders(self, sections, out_dir, chunk_raw_bytes=None):
+        """Write constants-only `.nbc` files for modules disasm cannot cover.
+
+        The normal OMNI path creates `.py` reconstructions and placeholder
+        `.nbc` files before the disassembler upgrades them. In `--nbc-only`
+        mode we skip those `.py` artefacts entirely; this method only emits
+        fallback NBC files for modules that will not be overwritten by
+        `disassemble_modules()`.
+        """
+        out_dir = Path(out_dir)
+        omni_dir = out_dir / 'omni_reconstructed'
+        omni_dir.mkdir(parents=True, exist_ok=True)
+        chunk_raw_bytes = chunk_raw_bytes or {}
+        mt_by_name = {e.get('name'): e for e in self.module_table} if self.module_table else {}
+        manifest = []
+        written = 0
+
+        def _path_for(name):
+            rel = self._section_name_to_module_path(name)
+            return omni_dir / (rel[:-3] + '.nbc' if rel.endswith('.py') else rel + '.nbc')
+
+        for name, items in sections.items():
+            items_list = list(items)
+            if not CAPSTONE_AVAILABLE:
+                reason = 'capstone_missing'
+            elif self.pe is None:
+                reason = 'no_pe'
+            elif not self.module_table:
+                reason = 'no_module_table'
+            else:
+                entry = mt_by_name.get(name)
+                in_table = bool(
+                    entry and entry.get('func_ptr')
+                    and 'BYTECODE' not in entry.get('flag_names', [])
+                    and 'EXTENSION' not in entry.get('flag_names', [])
+                )
+                reason = None if in_table else 'not_in_module_table'
+
+            if reason is None:
+                manifest.append({'section': name, 'rel_path': str(_path_for(name).relative_to(omni_dir)).replace(os.sep, '/')})
+                continue
+
+            try:
+                nbc_path = _path_for(name)
+                nbc_path.parent.mkdir(parents=True, exist_ok=True)
+                nbc_text = NuitkaCompactEmitter.render(
+                    module_name=name,
+                    constants=items_list,
+                    python_version=self.target_python,
+                    ops_absence_reason=reason,
+                    module_table_entry=mt_by_name.get(name),
+                    chunk_bytes=chunk_raw_bytes.get(name),
+                )
+                nbc_path.write_text(nbc_text, encoding='utf-8')
+                written += 1
+                manifest.append({
+                    'section': name,
+                    'rel_path': str(nbc_path.relative_to(omni_dir)).replace(os.sep, '/'),
+                    'nbc_only': True,
+                    'reason': reason,
+                })
+            except Exception:
+                continue
+
+        try:
+            (omni_dir / '_MANIFEST.json').write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False),
+                encoding='utf-8',
+            )
+        except Exception:
+            pass
         return written
 
     def disassemble_modules(self, output_dir, max_modules=None, max_bytes=16384,
@@ -7760,15 +7916,32 @@ class StaticalyExtractor:
         if max_modules:
             targets = targets[:max_modules]
 
-        # Pre-pass: count how many times each internal address is called
-        # across ALL targeted modules (the call-stats pre-pass must see
-        # the full target set, NOT the --only subset — otherwise the
-        # runtime helpers for the selected module won't rank correctly).
-        # The most-called ones are Nuitka runtime helpers; the aliases
-        # stay consistent across every module's disassembly so you can
-        # trace helper usage globally.
-        try:
+        # Apply the --only filter before expensive work in --nbc-only mode.
+        # We still sample a small context window from the rest of the binary for
+        # helper ranking, but full recursive disassembly is limited to the
+        # requested modules immediately.
+        only = getattr(self, 'only_modules', None)
+        if only and self.nbc_only:
+            filtered = [e for e in targets
+                        if module_matches_patterns(e['name'], only)]
+            log(f"  --only filter: {len(filtered)} of {len(targets)} "
+                f"module(s) match {only}")
+            selected_vas = {e.get('func_ptr') for e in filtered}
+            context = [e for e in targets if e.get('func_ptr') not in selected_vas]
+            stats_targets = filtered + context[:48]
+            if len(stats_targets) < len(targets):
+                log(f"  Runtime-helper prepass: sampling "
+                    f"{len(stats_targets)}/{len(targets)} module entries "
+                    f"({len(filtered)} selected + context)")
+            targets = filtered
+        else:
             stats_targets = targets
+
+        # Pre-pass: count how many times each internal address is called.
+        # The most-called ones are Nuitka runtime helpers; the aliases stay
+        # consistent across every module's disassembly so helper usage remains
+        # traceable without recursively disassembling the runtime in each file.
+        try:
             CALL_STATS_SAMPLE_LIMIT = 120
             if len(stats_targets) > CALL_STATS_SAMPLE_LIMIT:
                 stats_targets = stats_targets[:CALL_STATS_SAMPLE_LIMIT]
@@ -7778,11 +7951,9 @@ class StaticalyExtractor:
         except Exception:
             runtime_aliases, call_counter = {}, {}
 
-        # Apply the --only filter AFTER call-stats, so ranking is
-        # computed on the full binary but only the requested modules
-        # actually get full per-function recursive disasm + rendering.
-        only = getattr(self, 'only_modules', None)
-        if only:
+        # In the full pipeline, apply --only after call-stats so ranking is
+        # computed on the full sample while recursive rendering stays focused.
+        if only and not self.nbc_only:
             filtered = [e for e in targets
                         if module_matches_patterns(e['name'], only)]
             log(f"  --only filter: {len(filtered)} of {len(targets)} "
@@ -7802,12 +7973,30 @@ class StaticalyExtractor:
         except Exception:
             pass
 
+        def _nbc_path_for(mod_name):
+            rel = StaticalyExtractor._section_name_to_module_path(mod_name)
+            return omni_dir / (rel[:-3] + '.nbc'
+                               if rel.endswith('.py') else rel + '.nbc')
+
+        def _write_fallback_nbc(entry, mod_consts, reason='disasm_failed'):
+            mod_name = entry.get('name', '')
+            nbc_path = _nbc_path_for(mod_name)
+            nbc_path.parent.mkdir(parents=True, exist_ok=True)
+            text = NuitkaCompactEmitter.render(
+                module_name=mod_name,
+                constants=mod_consts,
+                python_version=self.target_python,
+                ops_absence_reason=reason,
+                module_table_entry=entry,
+                chunk_bytes=getattr(self, 'chunk_raw_bytes', {}).get(mod_name),
+            )
+            nbc_path.write_text(text, encoding='utf-8')
+
         for entry in targets:
             mod_name = entry['name']
             func_ptr = entry['func_ptr']
+            mod_consts = list(sections[mod_name]) if (sections and mod_name in sections) else []
             try:
-                mod_consts = list(sections[mod_name]) if (sections and mod_name in sections) else []
-
                 # Recursively disassemble the module entry AND every
                 # module-local function it reaches via `call`. Nuitka
                 # compiles every Python def as its own C entry point, so
@@ -7821,6 +8010,7 @@ class StaticalyExtractor:
                     max_bytes_per_fn=max_bytes,
                 )
                 if not infos:
+                    _write_fallback_nbc(entry, mod_consts, 'disasm_failed')
                     continue
 
                 # Aggregate ALL const_loads from every function to
@@ -7836,9 +8026,7 @@ class StaticalyExtractor:
                 # Replace / upgrade the .nbc that omni_reconstruct already
                 # wrote (or write a fresh one for modules that weren't
                 # decoded via omni).
-                rel = StaticalyExtractor._section_name_to_module_path(mod_name)
-                nbc_path = omni_dir / (rel[:-3] + '.nbc'
-                                        if rel.endswith('.py') else rel + '.nbc')
+                nbc_path = _nbc_path_for(mod_name)
                 nbc_path.parent.mkdir(parents=True, exist_ok=True)
 
                 nbc_text = NuitkaCompactEmitter.render(
@@ -7853,7 +8041,7 @@ class StaticalyExtractor:
                     chunk_bytes=getattr(self, 'chunk_raw_bytes', {}).get(mod_name),
                 )
 
-                # Guard against runaway file size. Raised to 8 MB so
+                # Guard against runaway file size. Kept high so
                 # we rarely hit it — and when we do, KEEP the impl
                 # bodies (the important part) and DROP the short
                 # wrapper stubs (3-4 op blocks that contain no source
@@ -7921,6 +8109,10 @@ class StaticalyExtractor:
                 nbc_path.write_text(nbc_text, encoding='utf-8')
                 written += 1
             except Exception:
+                try:
+                    _write_fallback_nbc(entry, mod_consts, 'disasm_failed')
+                except Exception:
+                    pass
                 continue
         return written
 
@@ -7944,13 +8136,22 @@ class StaticalyExtractor:
         sections = self.decode_sections()
         result['sections'] = len(sections)
 
-        raw_hits = self.raw_scan_bytecode()
-        result['raw_scan_pyc'] = self.write_pycs(raw_hits, output_dir)
+        if self.nbc_only:
+            result['nbc_only'] = True
+            result['raw_scan_pyc'] = 0
+            result['omni_reconstructed'] = 0
+            result['nbc_placeholders'] = self.emit_nbc_placeholders(
+                sections, output_dir,
+                chunk_raw_bytes=getattr(self, 'chunk_raw_bytes', {}),
+            )
+        else:
+            raw_hits = self.raw_scan_bytecode()
+            result['raw_scan_pyc'] = self.write_pycs(raw_hits, output_dir)
 
-        result['omni_reconstructed'] = self.omni_reconstruct(
-            sections, output_dir,
-            chunk_raw_bytes=getattr(self, 'chunk_raw_bytes', {}),
-        )
+            result['omni_reconstructed'] = self.omni_reconstruct(
+                sections, output_dir,
+                chunk_raw_bytes=getattr(self, 'chunk_raw_bytes', {}),
+            )
         # count nbc files on disk
         try:
             dump_dir = Path(output_dir) / 'omni_reconstructed'
@@ -7968,6 +8169,11 @@ class StaticalyExtractor:
                     output_dir, sections=sections)
             except Exception as _e:
                 result['modules_disassembled'] = 0
+            try:
+                dump_dir = Path(output_dir) / 'omni_reconstructed'
+                result['nbc_files'] = len(list(dump_dir.rglob('*.nbc')))
+            except Exception:
+                pass
 
         return result
 
@@ -9093,7 +9299,8 @@ class NuitkalizatorPro:
     """
 
     def __init__(self, target_path: str, output_dir: str, main_only: bool = False,
-                 only_modules=None, decompile_pyc: bool = True):
+                 only_modules=None, decompile_pyc: bool = True,
+                 nbc_only: bool = False):
         self.target = target_path
         self.output_dir = output_dir
         self.main_only = main_only
@@ -9102,6 +9309,7 @@ class NuitkalizatorPro:
         # compiled modules (the default behaviour).
         self.only_modules = only_modules
         self.decompile_pyc = decompile_pyc
+        self.nbc_only = nbc_only
         self.bypass = CommercialBypass()
         self.report = {
             'target': os.path.basename(target_path),
@@ -9145,27 +9353,34 @@ class NuitkalizatorPro:
 
         # === PHASE 1.5: Resource & Section Scan for Embedded Source ===
         print_section("PHASE 1.5: EMBEDDED SOURCE SCAN (resources + sections)")
-        log("Scanning ALL PE resources and sections for hidden Python source...")
-
-        resource_findings = scan_pe_resources_for_source(self.target, self.output_dir)
-        section_findings  = scan_sections_for_source(pe_data, self.output_dir)
-
-        all_source_candidates = (
-            [dict(r, origin='resource') for r in resource_findings] +
-            [dict(r, origin='section')  for r in section_findings]
-        )
-        high_conf_source = [r for r in all_source_candidates if r['confidence'] > 0.30]
-
-        if high_conf_source:
-            log_fire(f"FOUND {len(high_conf_source)} HIGH-CONFIDENCE SOURCE CANDIDATE(S)!")
-            for r in high_conf_source:
-                loc = r.get('path') or f"{r.get('section','?')}+0x{r.get('offset',0):X}"
-                log_fire(f"  [{r['origin']}] {loc}: conf={r['confidence']} -> {r['saved_at']}")
+        if self.nbc_only:
+            log("Skipping embedded source scan (--nbc-only).")
+            resource_findings = []
+            section_findings = []
+            all_source_candidates = []
+            high_conf_source = []
         else:
-            log(f"  Resources scanned: {len(resource_findings)}, "
-                f"Section blocks found: {len(section_findings)}")
-            log("  No high-confidence source in resources/sections "
-                "(may be in constants blob - checked in Phase 6)")
+            log("Scanning ALL PE resources and sections for hidden Python source...")
+
+            resource_findings = scan_pe_resources_for_source(self.target, self.output_dir)
+            section_findings  = scan_sections_for_source(pe_data, self.output_dir)
+
+            all_source_candidates = (
+                [dict(r, origin='resource') for r in resource_findings] +
+                [dict(r, origin='section')  for r in section_findings]
+            )
+            high_conf_source = [r for r in all_source_candidates if r['confidence'] > 0.30]
+
+            if high_conf_source:
+                log_fire(f"FOUND {len(high_conf_source)} HIGH-CONFIDENCE SOURCE CANDIDATE(S)!")
+                for r in high_conf_source:
+                    loc = r.get('path') or f"{r.get('section','?')}+0x{r.get('offset',0):X}"
+                    log_fire(f"  [{r['origin']}] {loc}: conf={r['confidence']} -> {r['saved_at']}")
+            else:
+                log(f"  Resources scanned: {len(resource_findings)}, "
+                    f"Section blocks found: {len(section_findings)}")
+                log("  No high-confidence source in resources/sections "
+                    "(may be in constants blob - checked in Phase 6)")
 
         self.report['embedded_source_scan'] = {
             'resource_entries':   len(resource_findings),
@@ -9261,9 +9476,13 @@ class NuitkalizatorPro:
                 log(f"  [BC] .bytecode ({len(data):,} bytes)")
             else:
                 module_chunks.append((name, data))
-                is_main = is_main_module(name)
-                icon = f"{C.BRIGHT_GREEN}[>>]{C.RESET}" if is_main else "    "
-                log(f"  {icon} {name} ({len(data):,} bytes)")
+                if not self.nbc_only:
+                    is_main = is_main_module(name)
+                    icon = f"{C.BRIGHT_GREEN}[>>]{C.RESET}" if is_main else "    "
+                    log(f"  {icon} {name} ({len(data):,} bytes)")
+        if self.nbc_only and module_chunks:
+            log(f"  Module list suppressed in --nbc-only mode "
+                f"({len(module_chunks)} constants chunks parsed).")
 
         self.report['stats']['total_modules'] = len(modules)
         analysis_module_chunks = module_chunks
@@ -9279,22 +9498,25 @@ class NuitkalizatorPro:
 
         # Save raw module chunks as .nuitka_const in a single folder (library_modules-style)
         nuitka_const_dir = os.path.join(self.output_dir, "library_modules")
-        os.makedirs(nuitka_const_dir, exist_ok=True)
-
         dumped_count = 0
-        for module_name, chunk_data in module_chunks:
-            parts = module_name.replace('.', os.sep)
-            safe_parts = re.sub(r'[<>:"|?*]', '_', parts)
-            out_path = os.path.join(nuitka_const_dir, safe_parts + ".nuitka_const")
+        if self.nbc_only:
+            log("Skipping library_modules .nuitka_const dump (--nbc-only).")
+        else:
+            os.makedirs(nuitka_const_dir, exist_ok=True)
+            for module_name, chunk_data in module_chunks:
+                parts = module_name.replace('.', os.sep)
+                safe_parts = re.sub(r'[<>:"|?*]', '_', parts)
+                out_path = os.path.join(nuitka_const_dir, safe_parts + ".nuitka_const")
 
-            os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-            with open(out_path, "wb") as f:
-                f.write(chunk_data)
+                os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+                with open(out_path, "wb") as f:
+                    f.write(chunk_data)
 
-            dumped_count += 1
+                dumped_count += 1
 
         self.report['stats']['nuitka_const_modules'] = dumped_count
-        log_ok(f"Saved {dumped_count} .nuitka_const module files into 'library_modules'")
+        if not self.nbc_only:
+            log_ok(f"Saved {dumped_count} .nuitka_const module files into 'library_modules'")
 
         # === PHASE 4.5: Nuitka module table (PE meta_path_loader_entries[]) ===
         print_section("PHASE 4.5: NUITKA MODULE TABLE")
@@ -9357,6 +9579,120 @@ class NuitkalizatorPro:
                 log_warn("Module table not located (table may be fragmented or custom)")
         except Exception as _mt_err:
             log_warn(f"Module table scan error: {_mt_err}")
+
+        if self.nbc_only:
+            print_section("PHASE 5: NBC-ONLY FAST PATH")
+            log("Skipping .pyc extraction, constants reports, secrets scan, "
+                "heuristic .py output, C-source output, and .pyc decompilation.")
+
+            self.report['bytecode_count'] = 0
+            self.report['modules'] = []
+            self.report['code_objects'] = []
+            self.report['secrets'] = []
+            self.report['stats'].update({
+                'nbc_only': True,
+                'bytecode_pyc': 0,
+                'modules_with_constants': 0,
+                'total_code_objects': 0,
+                'main_code_objects': 0,
+                'total_secrets': 0,
+                'total_strings': 0,
+            })
+            self.report['embedded_source_summary'] = {
+                'skipped': True,
+                'reason': '--nbc-only',
+            }
+            self.report.setdefault('decompilation', {}).update({
+                'skipped': True,
+                'reason': '--nbc-only',
+            })
+            self.report['c_source_reconstruction'] = {
+                'skipped': True,
+                'reason': '--nbc-only',
+            }
+
+            print_section("PHASE 11.7: STATICALY NBC GENERATION")
+            try:
+                log("Running Staticaly in NBC-only mode "
+                    + ("[xdis available]" if XDIS_AVAILABLE else "[xdis MISSING]")
+                    + (" [capstone available]" if CAPSTONE_AVAILABLE else " [capstone MISSING]"))
+                if not CAPSTONE_AVAILABLE:
+                    log_err("=" * 66)
+                    log_err(" capstone is NOT installed in the running Python.")
+                    log_err(" NBC files will be constants-only (@NO_OPS).")
+                    log_err(" Fix:  py -3.10 -m pip install capstone")
+                    log_err("=" * 66)
+                if not module_table_entries:
+                    log_err("=" * 66)
+                    log_err(" Nuitka module table was NOT located in the PE.")
+                    log_err(" NBC files will not have function-body @OPS blocks.")
+                    log_err("=" * 66)
+
+                st_dir = os.path.join(self.output_dir, "staticaly")
+                _pe_for_staticaly = None
+                try:
+                    import pefile as _pf
+                    _pe_for_staticaly = _pf.PE(data=pe_data)
+                except Exception:
+                    _pe_for_staticaly = None
+                extractor = StaticalyExtractor(
+                    blob_data,
+                    target_python=py_ver,
+                    pe_file=_pe_for_staticaly,
+                    module_table=module_table_entries,
+                    nbc_only=True,
+                )
+                if getattr(self, 'only_modules', None):
+                    extractor.only_modules = self.only_modules
+                st_result = extractor.run(st_dir)
+                log_ok(f"Staticaly sections decoded         : {st_result['sections']}")
+                log_ok(f"Staticaly .nbc files produced     : {st_result.get('nbc_files', 0)}")
+                log_ok(f"Staticaly modules disassembled    : {st_result.get('modules_disassembled', 0)}")
+                log(f"  Output                           : {st_result['output_dir']}")
+                self.report['staticaly'] = st_result
+            except Exception as _st_err:
+                log_warn(f"Staticaly NBC-only pipeline error: {_st_err}")
+                import traceback
+                traceback.print_exc()
+                self.report['staticaly'] = {'error': str(_st_err)}
+
+            print_section("PHASE 9: FINAL REPORT")
+            report_path = os.path.join(self.output_dir, "REPORT.json")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(self.report, f, indent=2, ensure_ascii=False, default=str)
+
+            ai_ready = organize_ai_ready_nbc(self.output_dir)
+            self.report['ai_ready_nbc'] = ai_ready
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(self.report, f, indent=2, ensure_ascii=False, default=str)
+            try:
+                import shutil as _shutil
+                _ctx = Path(ai_ready.get('context_dir', ''))
+                if _ctx.exists():
+                    _shutil.copy2(report_path, _ctx / 'REPORT.json')
+            except Exception:
+                pass
+
+            log_ok(f"Report saved: {report_path}")
+            if ai_ready.get('files'):
+                log_ok(f"AI-ready .nbc bundle: {ai_ready['files']} file(s) -> {ai_ready['output_dir']}")
+
+            print_section("FINAL RESULTS")
+            print(f"""
+  {C.BRIGHT_WHITE}Target:{C.RESET}                {self.report['target']}
+  {C.BRIGHT_WHITE}Python:{C.RESET}                {self.report['python_version']}
+  {C.BRIGHT_WHITE}Nuitka Edition:{C.RESET}        {self.report['nuitka_edition']}
+  {C.BRIGHT_WHITE}Encrypted blob:{C.RESET}        {'YES - BYPASS SUCCEEDED' if self.report['encrypted'] else 'NO'}
+
+  {C.BRIGHT_GREEN}Modules in blob:{C.RESET}       {self.report['stats'].get('total_modules', 0)}
+  {C.BRIGHT_GREEN}.nbc files:{C.RESET}            {ai_ready.get('files', 0)}
+  {C.BRIGHT_GREEN}.nbc with @OPS:{C.RESET}        {ai_ready.get('with_ops', 0)}
+  {C.BRIGHT_GREEN}.nbc without @OPS:{C.RESET}     {ai_ready.get('without_ops', 0)}
+
+  {C.BRIGHT_WHITE}Output:{C.RESET}                {self.output_dir}
+  {C.BRIGHT_WHITE}AI-ready .nbc:{C.RESET}         {ai_ready.get('output_dir', 'n/a')}
+""")
+            return True
 
         # === PHASE 5: .pyc extraction ===
         print_section("PHASE 5: BYTECODE EXTRACTION (.pyc)")
@@ -10519,6 +10855,9 @@ DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
     parser.add_argument('--no-banner', action='store_true', help='Hide banner')
     parser.add_argument('--no-pyc-decompile', action='store_true',
                         help='Skip Phase 12 .pyc -> .py decompilation; useful when preparing only .nbc files.')
+    parser.add_argument('--nbc-only', action='store_true',
+                        help='Fast path: generate AI-ready .nbc only; skips source scans, '
+                             '.pyc/.py/.c outputs, secrets reports, and .pyc decompilation.')
 
     # --- dynamic injection ---
     inj = parser.add_argument_group('Dynamic injection (--inject required to enable)')
@@ -10616,7 +10955,8 @@ DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
             output_dir=out_dir,
             main_only=not args.all,
             only_modules=only_list,
-            decompile_pyc=not args.no_pyc_decompile,
+            decompile_pyc=not (args.no_pyc_decompile or args.nbc_only),
+            nbc_only=args.nbc_only,
         )
         success = engine.run()
 

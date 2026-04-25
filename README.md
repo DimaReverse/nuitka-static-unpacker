@@ -94,6 +94,43 @@ More examples and the full flag reference: [`docs/usage.md`](docs/usage.md).
 
 ---
 
+## What's new in v7.4
+
+### Update: faster `.nbc` generation with `--nbc-only`
+
+v7.4 adds a focused fast path for AI-ready NBC generation. When your next step
+is source reconstruction from `.nbc`, use `--nbc-only` to skip the slower
+classic-analysis phases and write only the handoff bundle:
+
+```bash
+python nuitka_decompiler.py --source authorized_target.exe --list-modules --filter myapp
+python nuitka_decompiler.py --source authorized_target.exe --output OUT --only myapp,myapp.* --nbc-only
+```
+
+`--nbc-only` still extracts the constants blob, parses the Nuitka module table,
+decodes selected module constants, disassembles selected compiled modules, and
+writes `OUT/AI_READY_NBC/`. It skips embedded-source scans, `.pyc` extraction,
+heuristic `.py` output, C-source output, secrets reports, `.nuitka_const`
+dumps, and `.pyc -> .py` decompilation.
+
+The v7.4 path also reduces overhead by suppressing the full 1700+ module log in
+NBC-only mode and by limiting runtime-helper prepass work to the selected
+modules plus a small context sample.
+
+Real benchmark on `main.exe` from this repo:
+
+| Selection | Output | Time | Result |
+|---|---:|---:|---|
+| `__main__,modules.worker` | 2 `.nbc` | `151.09s` | 2/2 with `@OPS` |
+| `__main__,modules,modules.*,vendor,vendor.*` | 32 `.nbc` | `215.19s` | 32/32 with `@OPS` |
+
+For comparison, the same 32-module focused NBC generation before `--nbc-only`
+took about `307s`. The startup cost is still significant because the PE, blob,
+module list, and loader table must be parsed once; after that, adding more
+selected modules is much cheaper than the first module.
+
+---
+
 ## What's new in v7.3
 
 ### Update: AI-ready NBC/2 reconstruction bundle
@@ -123,8 +160,8 @@ python nuitka_decompiler.py --source authorized_target.exe --output OUT --only m
 ```
 
 `--no-pyc-decompile` skips the classic `.pyc -> .py` backend phase and keeps the
-run focused on the richer NBC/LLM evidence bundle. This is usually the cleanest
-mode when your next step is AI-assisted reconstruction.
+run focused on the richer NBC/LLM evidence bundle. For the fastest NBC-only
+workflow, use the v7.4 `--nbc-only` mode above.
 
 Each `NBC/2` file can include:
 
@@ -140,7 +177,7 @@ Use this flow for authorized samples where you want the highest-fidelity Python
 reconstruction possible:
 
 1. List modules first, then pick only the package or files you actually need.
-2. Generate the AI bundle with `--output OUT --only package,package.* --no-pyc-decompile`.
+2. Generate the AI bundle with `--output OUT --only package,package.* --nbc-only` on v7.4, or `--output OUT --only package,package.* --no-pyc-decompile` on v7.3.
 3. Open `OUT/AI_READY_NBC/NBC_MANIFEST.json` and prioritize entries with `"has_ops": true`.
 4. Feed the LLM one `.nbc` file at a time from `OUT/AI_READY_NBC/nbc/`.
 5. Add optional context files from `OUT/AI_READY_NBC/context/`, especially `REPORT.json`, `NUITKA_MODULE_TABLE.txt`, `NUITKA_RUNTIME_HELPERS.txt`, `_MANIFEST.json`, and `BYTECODE_MANIFEST.json` when present.
@@ -234,7 +271,7 @@ It came from persistence.
 Each small step — extracting one more constant, understanding one more structure, improving the tool slightly — felt like progress in a moment where everything else felt stuck.
 
 Over time, this turned into a serious, multi-year effort.  
-Multiple rewrites, failed attempts, and long nights of trial and error eventually led to what is now version 7.3.
+Multiple rewrites, failed attempts, and long nights of trial and error eventually led to what is now version 7.4.
 
 Today, I'm in a different phase of my life.  
 I'm working towards finishing my studies, building independence, and continuing to grow in the field of reverse engineering and software security — despite everything I was told I wouldn't be able to do.
@@ -259,6 +296,7 @@ If this project helps you, or if you build something on top of it, that means mo
 - **`.pyc` extraction**: recovers bytecode and writes per-module artifacts.
 - **Code object map**: function signatures / args / line metadata (where recoverable).
 - **AI-ready NBC/2 bundle**: writes self-contained `.nbc` evidence files plus a rebuilder skill workflow for LLM-assisted source reconstruction.
+- **NBC-only fast path**: `--nbc-only` writes `AI_READY_NBC` without slower `.pyc`, source, C-output, and secrets phases.
 - **Secrets scanner**: finds likely passwords/keys/URLs in extracted constants.
 - **Multi-backend decompilation**: tries multiple decompilers and falls back gracefully.
 - **JSON report**: writes a global `REPORT.json` plus per-module outputs.
