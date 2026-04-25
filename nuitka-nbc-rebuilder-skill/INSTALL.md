@@ -9,8 +9,11 @@ when Nuitka or the C compiler removed evidence.
 Generate an AI-ready bundle with the unpacker:
 
 ```powershell
-python nuitka_decompiler.py --source target.exe --output OUT --only myapp,myapp.* --no-pyc-decompile
+python nuitka_decompiler.py --source target.exe --output OUT --only myapp,myapp.* --nbc-only
 ```
+
+Use `--nbc-only` when you only need the LLM handoff bundle. It keeps `.nbc`
+generation and skips slower report/source/decompilation phases.
 
 Use files from:
 
@@ -32,7 +35,7 @@ Copy the folder into your skills directory:
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
-Copy-Item -Recurse -Force "C:\Users\Dimax\Downloads\test\nuitka-nbc-rebuilder" `
+Copy-Item -Recurse -Force ".\nuitka-nbc-rebuilder-skill" `
   "$env:USERPROFILE\.codex\skills\nuitka-nbc-rebuilder"
 ```
 
@@ -40,7 +43,7 @@ Claude Code-style installs can use:
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
-Copy-Item -Recurse -Force "C:\Users\Dimax\Downloads\test\nuitka-nbc-rebuilder" `
+Copy-Item -Recurse -Force ".\nuitka-nbc-rebuilder-skill" `
   "$env:USERPROFILE\.claude\skills\nuitka-nbc-rebuilder"
 ```
 

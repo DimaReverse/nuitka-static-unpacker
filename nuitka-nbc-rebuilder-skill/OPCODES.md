@@ -20,7 +20,7 @@ reconstruction.
 | `@CODE_OBJECTS` | preserved code-object metadata |
 | `@BLOCKS` | native block summary |
 | `@OPS 0xVA # qualname` | virtual operation stream for one block |
-| `@ASM 0xVA` | annotated native assembly for the same block |
+| `@ASM 0xVA` | source-relevant annotated native assembly for the same block |
 | `@FORENSICS` | context for functions without reachable `@OPS` |
 | `@NO_OPS` | missing disassembly marker |
 
@@ -73,7 +73,9 @@ tiny structural value such as `0`, `1`, `2`, or `-1`.
 | `RET` | return |
 
 `@OPS` is a source-level hint, not a complete decompiler. Use the matching
-`@ASM` block to confirm ambiguous control flow, call targets, and attributes.
+`@ASM` block to confirm ambiguous control flow, arithmetic, call targets, and
+attributes. The emitter may omit low-signal native moves from `@ASM` to keep
+`.nbc` files fast and model-friendly.
 
 ## Runtime Helper Rank Hints
 

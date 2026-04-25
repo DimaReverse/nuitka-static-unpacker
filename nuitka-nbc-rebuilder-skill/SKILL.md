@@ -11,6 +11,12 @@ bytecode listing. Nuitka may have removed comments, formatting, some local
 names, and may have inlined or optimized logic; never promise exact 1:1 output
 when the evidence is incomplete.
 
+If the user needs to generate inputs first, prefer:
+
+```bash
+python nuitka_decompiler.py --source target.exe --output OUT --only app,app.* --nbc-only
+```
+
 ## Output Contract
 
 Emit one Python code block per module:
@@ -42,6 +48,10 @@ instead of fabricating code.
 5. Prefer a short uncertain body over a plausible but unsupported body.
 6. Do not add comments, docstrings, logging, exception handling, async, crypto
    primitives, decorators, or helper functions unless the `.nbc` supports them.
+7. Do not collapse an evidenced sequence into `...`. If `@OPS` and `@ASM`
+   show imports, attribute chains, calls, branches, or returns, reconstruct the
+   smallest Python statement sequence that matches that evidence and mark only
+   the missing operand or receiver as uncertain.
 
 ## NBC/2 Sections
 
@@ -58,7 +68,9 @@ instead of fabricating code.
 - `@CODE_OBJECTS`: code-object metadata where Nuitka preserved it.
 - `@BLOCKS`: summary of disassembled native blocks.
 - `@OPS <va> # <qualname>`: virtual operations derived from native code.
-- `@ASM <va>`: annotated native assembly. Use this to resolve ambiguous `@OPS`.
+- `@ASM <va>`: source-relevant annotated native assembly. Low-signal native
+  moves may be omitted by the emitter; use this to resolve ambiguous `@OPS`,
+  arithmetic, comparisons, attribute names, and C-API calls.
 - `@FORENSICS` and `@NO_OPS <qualname>`: evidence for functions without a
   reachable `@OPS` body.
 - Bare `@NO_OPS`: the whole module lacks disassembly; emit only signatures and
@@ -73,14 +85,19 @@ instead of fabricating code.
 5. Map `@OPS` blocks to functions using the `# qualname` annotation first.
    If no annotation exists, use nearby string constants that look like
    qualnames. If still ambiguous, mark the body uncertain.
-6. Translate the `@ENTRY` block into imports, global assignments, class/function
+6. Resolve `C fn@0xVA` by looking up the matching `@OPS 0xVA` block before
+   deciding whether it is a helper call, nested function, or local method.
+7. Translate the `@ENTRY` block into imports, global assignments, class/function
    registration, and top-level calls only when the sequence is clear.
-7. Translate each function block. Use `@ASM` comments to confirm attribute
+8. Translate each function block. Use `@ASM` comments to confirm attribute
    names, C-API calls, call targets, and constants.
-8. For functions listed in `@FUNCS_DETECTED` but missing `@OPS`, inspect the
+9. Treat `C helper_*` as a known runtime-helper call with weaker semantics than
+   `C r#N`; consult `AI_READY_NBC/context/NUITKA_RUNTIME_HELPERS.txt` when
+   available before assigning Python meaning.
+10. For functions listed in `@FUNCS_DETECTED` but missing `@OPS`, inspect the
    matching `@FORENSICS` block. Emit logic only when adjacent constants or
    mentions plainly support it; otherwise emit `...` with an uncertainty reason.
-9. Run the anti-hallucination checklist before final output.
+11. Run the anti-hallucination checklist before final output.
 
 ## Virtual Ops
 
@@ -142,6 +159,12 @@ Before emitting code, verify:
 - No async/generator syntax appears without coroutine/generator evidence.
 
 If a line fails, replace that line with `# UNCERTAIN: <failed check>`.
+
+## Reconstruction Bias
+
+Be evidence-maximal, not stub-maximal. A body with five supported operations
+and one unknown receiver should become four or five Python lines plus one
+`# UNCERTAIN` marker, not a full `...` body. Preserve uncertainty locally.
 
 ## Confidence
 

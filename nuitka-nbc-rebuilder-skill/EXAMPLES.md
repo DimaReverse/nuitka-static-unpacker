@@ -190,3 +190,48 @@ def loadConfig():
     # UNCERTAIN: receiver object for config.get is inferred from attribute sequence, not explicitly named
     return config.get('saveLogs')
 ```
+
+## Example 6 - Partial Body Is Better Than A Full Stub
+
+Input excerpt:
+
+```text
+@CONSTS 5 mode=full_repr
+  0 s 'requests'
+  1 s 'get'
+  2 s 'https://example.test/api'
+  3 s 'json'
+  4 s 'token'
+
+@OPS 0x4100 # fetch_token
+  L c[0]
+  C capi:PyImport_ImportModule
+  L c[1]
+  C r#0
+  L c[2]
+  C r#2
+  L c[3]
+  C r#0
+  C r#1
+  L c[4]
+  C r#0
+  RET
+```
+
+Acceptable output:
+
+```python
+# MODULE: unknown
+# CONFIDENCE: 70% evidence-backed reconstruction
+# UNCERTAIN SPANS: 1
+
+import requests
+
+def fetch_token():
+    response = requests.get('https://example.test/api')
+    # UNCERTAIN: exact temporary names are not preserved; dict access is inferred from attribute/call sequence
+    return response.json()['token']
+```
+
+Why: the call chain and literals are evidenced, so a full `...` body would
+throw away useful recoverable structure.

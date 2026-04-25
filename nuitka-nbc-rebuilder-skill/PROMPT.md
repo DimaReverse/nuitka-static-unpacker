@@ -41,6 +41,8 @@ No prose outside the code block.
 4. If evidence is incomplete, emit `# UNCERTAIN: <specific reason>` and use
    `...` or the smallest safe fallback.
 5. Prefer incomplete but honest code over plausible unsupported code.
+6. When `@OPS`/`@ASM` support part of a body, reconstruct that part and mark
+   only the missing receiver, operand, branch, or return as uncertain.
 
 ## NBC/2 Reference
 
@@ -57,7 +59,9 @@ Important sections:
 - `@CODE_OBJECTS`: code-object metadata where available.
 - `@BLOCKS`: disassembly block summary.
 - `@OPS <va> # <qualname>`: virtual operations per native block.
-- `@ASM <va>`: annotated native assembly for the same block.
+- `@ASM <va>`: source-relevant annotated native assembly for the same block.
+  Low-signal native moves may be omitted; comments and arithmetic/control-flow
+  lines are the important evidence.
 - `@FORENSICS` / `@NO_OPS <qualname>`: evidence for missing function bodies.
 - Bare `@NO_OPS`: no module disassembly; emit only evidenced signatures and
   constants-backed globals.
@@ -107,10 +111,14 @@ C-API hints:
 4. Pair each `@OPS <va>` with its matching `@ASM <va>`.
 5. Map blocks to functions using the `# qualname` annotation first. If absent,
    use qualname-like string constants. If still unclear, mark uncertain.
-6. Translate `@ENTRY` into evidenced imports, globals, and registrations.
-7. Translate function blocks using `@OPS`; consult `@ASM` to resolve ambiguous
+6. Resolve `C fn@0xVA` by looking for a matching `@OPS 0xVA` block before
+   treating it as an opaque helper.
+7. Translate `@ENTRY` into evidenced imports, globals, and registrations.
+8. Translate function blocks using `@OPS`; consult `@ASM` to resolve ambiguous
    calls, attributes, constants, and local block calls.
-8. For missing bodies, inspect matching `@FORENSICS`. Emit body logic only when
+9. Treat `C helper_*` as a weaker runtime-helper hint than `C r#N`; use
+   `AI_READY_NBC/context/NUITKA_RUNTIME_HELPERS.txt` when available.
+10. For missing bodies, inspect matching `@FORENSICS`. Emit body logic only when
    adjacent constants or mentions plainly imply behavior. Otherwise emit:
 
 ```python
@@ -132,6 +140,9 @@ Before final output:
 - No async/generator syntax without coroutine/generator evidence.
 
 If a line fails, replace it with `# UNCERTAIN: <failed check>`.
+
+Bias toward local reconstruction: do not turn a partially evidenced function
+into a full stub when supported imports, calls, branches, or returns are visible.
 
 <<<END PROMPT>>>
 
