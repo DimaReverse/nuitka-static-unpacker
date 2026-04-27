@@ -24,213 +24,30 @@ Analysis output:
   - Code object metadata and structure mapping
 """
 
-import os
-import sys
-import time
-import struct
-import marshal
-import types
-import json
-import zlib
-import random
-import hashlib
-import base64
 import argparse
-import re
+import base64
+import hashlib
+import json
+import marshal
 import math
-import subprocess
-import threading
+import os
 import platform
-from math import copysign, isnan, isinf
+import random
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+import types
+import zlib
 from datetime import datetime
+from math import copysign
 from pathlib import Path
-from collections import deque
-from typing import Dict, List, Set, Tuple, Any
-
-# Fix encoding for Windows
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-except Exception:
-    pass
-
-# =============================================================================
-# COLORS & STYLING
-# =============================================================================
-
-class Colors:
-    BLACK = '\033[30m'; RED = '\033[31m'; GREEN = '\033[32m'
-    YELLOW = '\033[33m'; BLUE = '\033[34m'; MAGENTA = '\033[35m'
-    CYAN = '\033[36m'; WHITE = '\033[37m'
-    BRIGHT_RED = '\033[91m'; BRIGHT_GREEN = '\033[92m'
-    BRIGHT_YELLOW = '\033[93m'; BRIGHT_BLUE = '\033[94m'
-    BRIGHT_MAGENTA = '\033[95m'; BRIGHT_CYAN = '\033[96m'
-    BRIGHT_WHITE = '\033[97m'
-    BOLD = '\033[1m'; DIM = '\033[2m'; UNDERLINE = '\033[4m'
-    RESET = '\033[0m'
-    BG_RED = '\033[41m'; BG_GREEN = '\033[42m'; BG_CYAN = '\033[46m'
-
-C = Colors()
-
-if sys.platform == 'win32':
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleMode(
-            ctypes.windll.kernel32.GetStdHandle(-11), 7)
-    except Exception:
-        for attr in dir(C):
-            if not attr.startswith('_'):
-                setattr(C, attr, '')
-
-    # Suppress Windows error dialogs for this process AND its children.
-    # pycdc.exe and other third-party decompilers occasionally crash with
-    # a win32 exception on malformed marshal data. When that happens
-    # Windows pops up the "Just-In-Time debugger" modal which blocks the
-    # whole pipeline (and is terrifying for users). Setting the process
-    # error mode forces Windows to silently fail the child instead.
-    # Flags:  SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
-    #       | SEM_NOOPENFILEERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT
-    try:
-        import ctypes as _ctypes_err
-        _SEM_FAILCRITICALERRORS   = 0x0001
-        _SEM_NOGPFAULTERRORBOX    = 0x0002
-        _SEM_NOALIGNMENTFAULTEXCEPT = 0x0004
-        _SEM_NOOPENFILEERRORBOX   = 0x8000
-        _ctypes_err.windll.kernel32.SetErrorMode(
-            _SEM_FAILCRITICALERRORS
-            | _SEM_NOGPFAULTERRORBOX
-            | _SEM_NOOPENFILEERRORBOX
-            | _SEM_NOALIGNMENTFAULTEXCEPT
-        )
-        # SetThreadErrorMode (available from Vista+) doubles down
-        try:
-            _ctypes_err.windll.kernel32.SetThreadErrorMode(
-                _SEM_FAILCRITICALERRORS
-                | _SEM_NOGPFAULTERRORBOX
-                | _SEM_NOOPENFILEERRORBOX, None)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-# Subprocess creation flags used for every external-tool invocation
-# (pycdc, pycdas, etc.). CREATE_NO_WINDOW hides any transient console
-# window; on Windows we also rely on the SetErrorMode above to keep
-# child-process GP faults silent.
-if sys.platform == 'win32':
-    _SAFE_SUBPROCESS_FLAGS = 0x08000000  # CREATE_NO_WINDOW
-else:
-    _SAFE_SUBPROCESS_FLAGS = 0
-
-
-def run_external_tool(cmd, *, timeout=60, input_bytes=None):
-    """Run an external CLI tool with ALL crash dialogs suppressed.
-
-    Returns a `subprocess.CompletedProcess`-like object with `returncode`,
-    `stdout`, `stderr`. On hard failure (timeout, OS error, access denied
-    because the child crashed) returns a simulated `(returncode=-1,
-    stdout=b"", stderr=b"<reason>")` instead of raising — this is what
-    the pipeline needs to fall back gracefully without aborting.
-    """
-    import subprocess as _sp
-    try:
-        r = _sp.run(
-            cmd,
-            capture_output=True,
-            timeout=timeout,
-            input=input_bytes,
-            creationflags=_SAFE_SUBPROCESS_FLAGS,
-        )
-        return r
-    except _sp.TimeoutExpired:
-        class _R:
-            returncode = -1
-            stdout = b''
-            stderr = b'TIMEOUT'
-        return _R()
-    except (OSError, _sp.SubprocessError) as e:
-        class _R:
-            returncode = -1
-            stdout = b''
-            stderr = str(e).encode()
-        return _R()
-
-try:
-    BANNER = f"""
-{C.BRIGHT_RED}    _   _       _ _   _         _ _          _             {C.RESET}
-{C.BRIGHT_YELLOW}   | \\ | |_   _(_) |_| | ____ _| (_)______ _| |_ ___  _ __ {C.RESET}
-{C.BRIGHT_GREEN}   |  \\| | | | | | __| |/ / _` | | |_  / _` | __/ _ \\| '__|{C.RESET}
-{C.BRIGHT_CYAN}   | |\\  | |_| | | |_|   < (_| | | |/ / (_| | || (_) | |   {C.RESET}
-{C.BRIGHT_BLUE}   |_| \\_|\\__,_|_|\\__|_|\\_\\__,_|_|_/___\\__,_|\\__\\___/|_|   {C.RESET}
-
-{C.BOLD}{C.BRIGHT_WHITE}   <<<  Nuitka Static Unpacker v7.3 | by dimareverse  >>>{C.RESET}
-{C.BOLD}{C.BRIGHT_WHITE}   <<<  Authorized static analysis | Dynamic lab mode (opt) >>>{C.RESET}
-"""
-except Exception:
-    BANNER = """
-   Nuitka Static Unpacker v7.3 - by dimareverse
-   Authorized static analysis | Dynamic lab mode (optional)
-"""
-
-
-# =============================================================================
-# PROGRESS & LOGGING
-# =============================================================================
-
-class ProgressBar:
-    def __init__(self, total, desc="Processing", width=40, spinner='fire'):
-        self.total = max(total, 1)
-        self.current = 0
-        self.desc = desc
-        self.width = width
-        self.start_time = time.time()
-        self.spinner_frames = ['*', '+', 'x', '+']
-        self.frame = 0
-
-    def update(self, n=1):
-        self.current = min(self.current + n, self.total)
-        self.frame = (self.frame + 1) % len(self.spinner_frames)
-        self._render()
-
-    def _render(self):
-        progress = self.current / self.total
-        filled = int(self.width * progress)
-        bar = ""
-        for i in range(self.width):
-            if i < filled:
-                if i < self.width * 0.3: bar += f"{C.BRIGHT_RED}#"
-                elif i < self.width * 0.6: bar += f"{C.BRIGHT_YELLOW}#"
-                else: bar += f"{C.BRIGHT_GREEN}#"
-            else: bar += f"{C.DIM}."
-        bar += C.RESET
-        elapsed = time.time() - self.start_time
-        eta = (elapsed / self.current * (self.total - self.current)) if self.current > 0 else 0
-        s = self.spinner_frames[self.frame]
-        status = (f"\r{C.BOLD}{C.BRIGHT_CYAN}[{s}]{C.RESET} "
-                  f"{C.BRIGHT_WHITE}{self.desc}{C.RESET} [{bar}] "
-                  f"{C.BRIGHT_YELLOW}{progress*100:5.1f}%{C.RESET} "
-                  f"{C.DIM}({self.current}/{self.total}){C.RESET} "
-                  f"{C.BRIGHT_MAGENTA}ETA: {int(eta)}s{C.RESET}")
-        print(status, end='', flush=True)
-
-    def finish(self, message="Done!"):
-        print(f"\r{' ' * 120}\r", end='')
-        print(f"{C.BRIGHT_GREEN}[OK]{C.RESET} {C.BRIGHT_WHITE}{self.desc}{C.RESET}: {C.BRIGHT_GREEN}{message}{C.RESET}")
-
-
-def print_section(title):
-    width = 65
-    print()
-    print(f"{C.BRIGHT_CYAN}{'=' * width}{C.RESET}")
-    centered = title.center(width - 4)
-    print(f"{C.BRIGHT_CYAN}||{C.RESET} {C.BOLD}{C.BRIGHT_WHITE}{centered}{C.RESET} {C.BRIGHT_CYAN}||{C.RESET}")
-    print(f"{C.BRIGHT_CYAN}{'=' * width}{C.RESET}")
-
-def log(msg): print(f"{C.BRIGHT_CYAN}[**]{C.RESET} {msg}")
-def log_ok(msg): print(f"{C.BRIGHT_GREEN}[OK]{C.RESET} {msg}")
-def log_err(msg): print(f"{C.BRIGHT_RED}[!!]{C.RESET} {msg}")
-def log_warn(msg): print(f"{C.BRIGHT_YELLOW}[!!]{C.RESET} {msg}")
-def log_fire(msg): print(f"{C.BRIGHT_RED}[>>]{C.RESET} {C.BOLD}{msg}{C.RESET}")
+from sys import exit, version_info, stderr, executable
+from typing import List
+from process_utils import run_external_tool
+from terminal_ui import C, ProgressBar, log, log_err, log_fire, log_ok, log_warn, print_section
 
 
 # =============================================================================
@@ -836,7 +653,7 @@ def detect_python_version_from_pe(pe_data: bytes) -> tuple:
                 return (major, minor)
     except Exception:
         pass
-    return sys.version_info[:2]
+    return version_info[:2]
 
 
 def detect_nuitka_edition(pe_data: bytes, blob_data: bytes = None) -> str:
@@ -1277,7 +1094,7 @@ def search_constants_for_source(constants: list, module_name: str, output_dir: s
 # VLQ READER
 # =============================================================================
 
-_CURRENT_NUITKA_TARGET_PYTHON = sys.version_info[:2]
+_CURRENT_NUITKA_TARGET_PYTHON = version_info[:2]
 _Nuitka_END_OF_STREAM = object()
 _Nuitka_PARSE_ERROR = object()
 
@@ -2545,7 +2362,7 @@ class NuitkaModuleTableParser:
                 j = i
                 while j < sz and 0x20 <= sec_data[j] < 0x7F:
                     j += 1
-                if j > i and j < sz and sec_data[j] == 0:
+                if i < j < sz and sec_data[j] == 0:
                     if j - i >= 2:
                         try:
                             s = sec_data[i:j].decode('ascii')
@@ -2927,7 +2744,7 @@ class NuitkaBlobDecoder:
 
     @staticmethod
     def _special_value(idx: int):
-        m = {0: Ellipsis, 1: NotImplemented, 2: sys.version_info}
+        m = {0: Ellipsis, 1: NotImplemented, 2: version_info}
         return m.get(idx, None)
 
     # ---- recursive constant decoder ----
@@ -3467,7 +3284,7 @@ def _marshal_candidate_versions(version_hint):
         {v for v in _xdis_by_version
          if re.fullmatch(r"\d+\.\d+", v) and _xdis_version_sort_key(v) >= (3, 5)},
         key=_xdis_version_sort_key, reverse=True)
-    runtime = f"{sys.version_info.major}.{sys.version_info.minor}"
+    runtime = f"{version_info.major}.{version_info.minor}"
     if runtime in versions:
         rk = _xdis_version_sort_key(runtime)
         lower = [v for v in versions if v != runtime and _xdis_version_sort_key(v) <= rk]
@@ -7401,7 +7218,7 @@ class StaticalyExtractor:
                 if ver and ver in _xdis_by_version:
                     target_python = tuple(int(x) for x in ver.split("."))
             if target_python is None:
-                target_python = sys.version_info[:2]
+                target_python = version_info[:2]
         self.target_python = tuple(target_python[:2])
         self.target_ver_str = f"{self.target_python[0]}.{self.target_python[1]}"
         set_nuitka_target_python(self.target_python)
@@ -8231,7 +8048,7 @@ def create_pyc_file(code_obj, output_path, python_version=None):
     """Create a valid .pyc file from a code object. Kept for backward compat."""
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     if python_version is None:
-        python_version = sys.version_info[:2]
+        python_version = version_info[:2]
     if not isinstance(code_obj, types.CodeType):
         return False
     marshalled = marshal.dumps(code_obj)
@@ -8321,11 +8138,11 @@ def extract_bytecode_modules(bytecode_chunk: bytes, output_dir: str, python_vers
     count = struct.unpack('<H', bytecode_chunk[0:2])[0]
     log(f".bytecode chunk: {count} compiled modules (target Python {python_version[0]}.{python_version[1]})")
 
-    py_match = tuple(python_version[:2]) == sys.version_info[:2]
+    py_match = tuple(python_version[:2]) == version_info[:2]
     if py_match:
         log_ok(f"  Running Python matches target ({python_version[0]}.{python_version[1]}) — full marshal parsing available")
     else:
-        log_warn(f"  Running Python {sys.version_info[0]}.{sys.version_info[1]} != target {python_version[0]}.{python_version[1]}")
+        log_warn(f"  Running Python {version_info[0]}.{version_info[1]} != target {python_version[0]}.{python_version[1]}")
         log_warn(f"  Will fall back to filename-string scanning when marshal.loads fails")
 
     pos = 2
@@ -8751,7 +8568,7 @@ def _detect_decompiler(py_ver=None):
          'binary': str|None,  # path for external tools
          'priority': int}      # lower = tried first
     """
-    import subprocess, shutil
+    import shutil
     target_ver = py_ver or (0, 0)
     available = []
 
@@ -8821,7 +8638,7 @@ def _try_autoinstall_pycdc():
     log_warn("  pycdc not found. Trying pip install decompyle3/uncompyle6 as fallback...")
     for pkg in ('decompyle3', 'uncompyle6'):
         r = run_external_tool(
-            [sys.executable, '-m', 'pip', 'install', pkg],
+            [executable, '-m', 'pip', 'install', pkg],
             timeout=120,
         )
         if r.returncode == 0:
@@ -9002,9 +8819,6 @@ def _decompile_pyc(pyc_path, out_py_path, decompiler_info):
 
     return False
 
-    return False
-
-
 def _is_code(obj):
     """True if obj is a code object (works across Python versions)."""
     return hasattr(obj, 'co_code') or hasattr(obj, 'co_code_adaptive')
@@ -9012,7 +8826,6 @@ def _is_code(obj):
 
 def _make_func_src(co, indent=''):
     """Return lines of pseudo-source for a function/method code object."""
-    import dis
     ii = indent + '    '
     lines = []
 
@@ -9226,7 +9039,7 @@ def _make_class_src(co, indent=''):
 
 def _pyc_dis(pyc_path, out_path):
     """Convert a .pyc to readable pseudo-source (no external decompiler needed)."""
-    import dis, marshal, io
+    import marshal, io
     try:
         with open(pyc_path, 'rb') as f:
             f.read(16)   # magic + flags + mtime + size (PEP 552)
@@ -10808,7 +10621,7 @@ def main():
     # ------------------------------------------------------------------ find default DLL/hook next to this script
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _default_dll  = os.path.join(_script_dir,
-                                  "hook64.dll" if platform.machine().endswith("64") else "hook32.dll")
+                                 "hook64.dll" if platform.machine().endswith("64") else "hook32.dll")
     _default_hook = os.path.join(_script_dir, "__hook__.py")
 
     parser = argparse.ArgumentParser(
@@ -10939,7 +10752,7 @@ DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
                     _sel = ",".join(_n for _n,_ in _shown if _n != '.bytecode')
                     print(f"\n  --only {_sel}")
                     raise SystemExit(0)
-            print("[ERROR] No Nuitka blob found.", file=sys.stderr)
+            print("[ERROR] No Nuitka blob found.", file=stderr)
             raise SystemExit(1)
 
     if _inject_only:
@@ -11038,11 +10851,10 @@ DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        exit(main())
     except KeyboardInterrupt:
         print(f"\n\n{C.BRIGHT_RED}[!] Interrupted by user{C.RESET}")
     except Exception as e:
         print(f"\n{C.BRIGHT_RED}[FATAL] {e}{C.RESET}")
         import traceback
         traceback.print_exc()
-
