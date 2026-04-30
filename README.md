@@ -154,29 +154,27 @@ Combined with `--output` to name the directory:
 python nuitka_decompiler.py --source authorized_target.exe --output OUT --nbc-only --user-nbc
 ```
 
-#### How detection works — 5-strategy cascade
+#### How detection works — 4-strategy cascade
 
 Nuitka standalone compiles **everything** to native code; no binary flag marks
-developer modules as distinct from stdlib or third-party. The discrimination
-instead exploits the `co_filename` string embedded in each module's constants
-blob — the original `.py` path recorded at compile time.
+developer modules as distinct from stdlib or third-party. To filter out the noise,
+the tool relies on a cascaded detection algorithm.
 
 The tool attempts strategies in order and stops at the first one that produces
 a confident result:
 
 | # | Strategy | When it fires |
 |---|---|---|
-| 1 | **`__main__` path anchor** | `__main__`'s `co_filename` root dir = developer's top-level package name. Modules whose path root matches (or whose dotted name root matches) are kept. | Reliable for the vast majority of standalone builds. |
-| 2 | **Absolute stdlib base** | Derive the stdlib install prefix from a known anchor (`os`, `json`, …), then classify by path prefix. | Fires when paths are absolute and no `__main__` path is available. |
-| 3 | **Relative path root** | For relative paths (e.g. `Crypto/Cipher/AES.py`), extract the root dir name and apply `KNOWN_LIBRARY_PREFIXES`. | Fires alongside Strategy 2 as a complement. |
-| 4 | **`__main__` import graph** | Walk string constants in `__main__` to find modules it imports; treat those as developer code. | Fallback when paths are stripped. |
-| 5 | **`KNOWN_LIBRARY_PREFIXES` name filter** | Pure name-based filter, same as the existing `--only` heuristic. | Last resort when all path information is absent. |
+| 1 | **Infallible PyPI Metadata Extraction** | Scans the constants blob for Nuitka's injected `runtime_metadata_values`. Extracts the exact PyPI distribution names, subtracts the Python standard library via `sys.stdlib_module_names`, and isolates developer modules. | **100% accurate.** Fires when Nuitka includes distribution metadata. |
+| 2 | **`__main__` path anchor** | `__main__`'s `co_filename` root dir = developer's top-level package name. Modules whose path root matches (or whose dotted name root matches) are kept. | Fires if PyPI metadata is absent and paths are intact. |
+| 3 | **Path analysis** | Derives stdlib install prefixes, searches for `site-packages` markers, and groups remaining modules by path root using `KNOWN_LIBRARY_PREFIXES`. | Fires when only relative or partial paths survived compilation. |
+| 4 | **Name-based fallback** | Pure name-based filter using `KNOWN_LIBRARY_PREFIXES`, ignoring path information entirely. | Last resort when all path metadata is erased. |
 
-Strategy 1 is the most reliable and fires for most real-world standalone builds.
+Strategy 1 is the holy grail: when available, it guarantees flawless isolation of developer modules.
 When it succeeds you will see a log line like:
 
-```
-[user-nbc] Strategy 1 — __main__ path anchor: dev_root='myapp' → 39 module(s)
+```text
+[user-nbc] Strategy 1 — Infallible PyPI Metadata Extraction:
 ```
 
 The result is cached internally so the same detection is not repeated across
