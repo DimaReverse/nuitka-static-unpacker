@@ -131,6 +131,80 @@ selected modules is much cheaper than the first module.
 
 ---
 
+## What's new in v7.5
+
+### New: `--user-nbc` — extract only the developer's own modules
+
+When you run `--nbc-only` on a typical standalone Nuitka binary, the output
+contains hundreds of `.nbc` files for Python stdlib modules (`os`, `json`,
+`asyncio`, …) and every third-party package bundled by Nuitka. Only a small
+fraction belong to the developer's own code.
+
+`--user-nbc` filters all three NBC generation phases — `omni_reconstruct`,
+`emit_nbc_placeholders`, and `disassemble_modules` — so only the developer's
+modules are written to `AI_READY_NBC/`.
+
+```bash
+python nuitka_decompiler.py --source authorized_target.exe --nbc-only --user-nbc
+```
+
+Combined with `--output` to name the directory:
+
+```bash
+python nuitka_decompiler.py --source authorized_target.exe --output OUT --nbc-only --user-nbc
+```
+
+#### How detection works — 5-strategy cascade
+
+Nuitka standalone compiles **everything** to native code; no binary flag marks
+developer modules as distinct from stdlib or third-party. The discrimination
+instead exploits the `co_filename` string embedded in each module's constants
+blob — the original `.py` path recorded at compile time.
+
+The tool attempts strategies in order and stops at the first one that produces
+a confident result:
+
+| # | Strategy | When it fires |
+|---|---|---|
+| 1 | **`__main__` path anchor** | `__main__`'s `co_filename` root dir = developer's top-level package name. Modules whose path root matches (or whose dotted name root matches) are kept. | Reliable for the vast majority of standalone builds. |
+| 2 | **Absolute stdlib base** | Derive the stdlib install prefix from a known anchor (`os`, `json`, …), then classify by path prefix. | Fires when paths are absolute and no `__main__` path is available. |
+| 3 | **Relative path root** | For relative paths (e.g. `Crypto/Cipher/AES.py`), extract the root dir name and apply `KNOWN_LIBRARY_PREFIXES`. | Fires alongside Strategy 2 as a complement. |
+| 4 | **`__main__` import graph** | Walk string constants in `__main__` to find modules it imports; treat those as developer code. | Fallback when paths are stripped. |
+| 5 | **`KNOWN_LIBRARY_PREFIXES` name filter** | Pure name-based filter, same as the existing `--only` heuristic. | Last resort when all path information is absent. |
+
+Strategy 1 is the most reliable and fires for most real-world standalone builds.
+When it succeeds you will see a log line like:
+
+```
+[user-nbc] Strategy 1 — __main__ path anchor: dev_root='myapp' → 39 module(s)
+```
+
+The result is cached internally so the same detection is not repeated across
+the three output phases.
+
+#### Universality and limitations
+
+`--user-nbc` works reliably when:
+- The binary was built in **standalone** mode (the common case).
+- At least one of the module constants blobs contains an embedded `co_filename`
+  path (true for almost all non-obfuscated Nuitka builds).
+- The developer's code lives under a distinct top-level package or directory
+  name that does not appear in `KNOWN_LIBRARY_PREFIXES`.
+
+Edge cases where results may be approximate:
+- Builds compiled with path-stripping or obfuscation plugins that erase all
+  `co_filename` data → Strategy 4/5 fallback, name-based only.
+- Flat single-file apps with no package dir (dev module is just `__main__`) →
+  only `__main__` is returned; combine with `--only` to include helpers.
+- Multi-package developer projects where secondary packages are not imported
+  directly from `__main__` → Strategy 1 may miss them; Strategy 2/3 will pick
+  them up if paths are absolute.
+
+In all cases, `--user-nbc` is strictly better than no filter: it will never
+include stdlib or well-known third-party packages that Nuitka always bundles.
+
+---
+
 ## What's new in v7.3
 
 ### Update: AI-ready NBC/2 reconstruction bundle
@@ -297,6 +371,7 @@ If this project helps you, or if you build something on top of it, that means mo
 - **Code object map**: function signatures / args / line metadata (where recoverable).
 - **AI-ready NBC/2 bundle**: writes self-contained `.nbc` evidence files plus a rebuilder skill workflow for LLM-assisted source reconstruction.
 - **NBC-only fast path**: `--nbc-only` writes `AI_READY_NBC` without slower `.pyc`, source, C-output, and secrets phases.
+- **Developer-only NBC filter**: `--user-nbc` (combine with `--nbc-only`) auto-detects and extracts only the developer's own modules — stdlib and third-party are excluded automatically via a 5-strategy cascade anchored on `__main__`'s embedded source path.
 - **Secrets scanner**: finds likely passwords/keys/URLs in extracted constants.
 - **Multi-backend decompilation**: tries multiple decompilers and falls back gracefully.
 - **JSON report**: writes a global `REPORT.json` plus per-module outputs.
@@ -385,6 +460,13 @@ python list_modules.py authorized_target.exe --filter myapp --copy-cmd
 
 ```bash
 python nuitka_decompiler.py --source authorized_target.exe --only mypackage,mypackage.utils
+```
+
+### Extract only developer modules (skip stdlib and third-party)
+
+```bash
+python nuitka_decompiler.py --source authorized_target.exe --nbc-only --user-nbc
+python nuitka_decompiler.py --source authorized_target.exe --output OUT --nbc-only --user-nbc
 ```
 
 ### Dynamic mode: inject into running process

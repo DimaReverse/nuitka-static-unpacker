@@ -7393,6 +7393,9 @@ class StaticalyExtractor:
         # Set by NuitkalizatorPro after construction. When None, the
         # pipeline disassembles every compiled entry in the table.
         self.only_modules = None
+        # When True, NBC generation is restricted to user (non-stdlib/non-library)
+        # modules only. Set by NuitkalizatorPro when --user-nbc is passed.
+        self.user_nbc = False
         if target_python is None:
             # try xdis version probe
             target_python = None
@@ -7405,6 +7408,233 @@ class StaticalyExtractor:
         self.target_python = tuple(target_python[:2])
         self.target_ver_str = f"{self.target_python[0]}.{self.target_python[1]}"
         set_nuitka_target_python(self.target_python)
+        # Cache for _find_user_sections result — computed once, reused by
+        # omni_reconstruct, emit_nbc_placeholders, AND disassemble_modules.
+        self._user_sections_cache = None
+
+    # ------------------------------------------------------------------
+    # USER-MODULE AUTO-DETECTION  (used by --user-nbc)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _py_path_from_constants(items) -> str:
+        """Return the first *.py string constant found in a module's items, or ''."""
+        for item in items:
+            if isinstance(item, str) and item.endswith('.py') and len(item) > 3:
+                return item.replace('\\', '/')
+        return ''
+
+    @staticmethod
+    def _path_root(p: str) -> str:
+        """Return the top-level directory (or bare name) from a normalised path.
+
+        'Crypto/Cipher/AES.py'  -> 'Crypto'
+        'os.py'                 -> 'os'
+        '/usr/lib/python3/os.py'-> '' (absolute → caller uses other checks)
+        """
+        parts = p.split('/')
+        root = parts[0] if parts else ''
+        if root.endswith('.py'):
+            root = root[:-3]
+        # Absolute path: first part is empty (Linux) or drive letter (Windows)
+        if not root or (len(root) == 2 and root[1] == ':') or root == '':
+            return ''
+        return root
+
+    # Path fragments that unambiguously identify third-party origin.
+    _SITEPACKAGES_MARKERS = (
+        '/site-packages/', '/dist-packages/',
+        'site-packages\\', 'dist-packages\\',
+    )
+    # Path fragments that unambiguously identify stdlib origin (absolute paths).
+    _STDLIB_PATH_MARKERS = (
+        '/lib/python', '\\lib\\python',
+        '/python3.', '\\python3.',
+        '/python2.', '\\python2.',
+    )
+    # Well-known stdlib anchors: if their path is absolute, tells us stdlib root.
+    _STDLIB_ANCHORS = ('os', 'sys', 'json', 'io', 're', 'abc', 'typing',
+                       'pathlib', 'collections', 'functools', 'importlib')
+
+    def _find_user_sections(self, sections: dict) -> set:
+        """Return the set of section names that belong to the developer's own code.
+
+        Uses three cascaded strategies — each more robust than the previous:
+
+        Strategy A — co_filename path analysis (most universal)
+        --------------------------------------------------------
+        Every compiled module embeds its original source path as a *.py string
+        constant (co_filename).  We use well-known stdlib modules present in
+        the blob to reconstruct the pre-compilation developer directory.
+
+        Research finding (Nuitka-commercial-4.0.6/nuitka/ModuleRegistry.py):
+        The compiler tracks "root modules" (developer's code) separately from
+        dependencies at compile time via addRootModule() / addUsedModule(), but
+        this distinction is NOT preserved in any binary flag or struct field.
+        The Nuitka_MetaPathBasedLoaderEntry struct has no "is_root" field.
+
+        Strategy (cascaded, stops at first confident result):
+
+          1. __main__ path anchor  — most precise, zero false positives
+          2. Absolute path markers — site-packages / stdlib dir detection
+          3. Relative path + KNOWN_LIBRARY_PREFIXES — path-rooted heuristic
+          4. __main__ import-graph — when paths are stripped
+          5. KNOWN_LIBRARY_PREFIXES name fallback
+        """
+        if self._user_sections_cache is not None:
+            return self._user_sections_cache
+
+        # ── collect co_filename for every section ──────────────────────────
+        paths = {}   # name -> normalised forward-slash path string (may be '')
+        for name, items in sections.items():
+            paths[name] = self._py_path_from_constants(items)
+
+        has_paths = sum(1 for p in paths.values() if p)
+        path_coverage = has_paths / max(len(sections), 1)
+
+        # ══ Strategy 1: __main__ path anchor ══════════════════════════════
+        # __main__ is the developer's entry point — always. Its co_filename
+        # path root is the developer's top-level package directory.
+        #
+        # Example: __main__ path = 'myapp/__main__.py'
+        #   → dev_root = 'myapp'
+        #   → keep: __main__, myapp, myapp.core, myapp.utils …
+        #   → drop: aiohappyeyeballs, aiosignal, os, json, Crypto …
+        #
+        # This is zero-heuristic: it uses only the actual embedded paths.
+        main_path = paths.get('__main__', '') or paths.get('__parents_main__', '')
+        dev_root = self._path_root(main_path) if main_path else ''
+
+        if dev_root:
+            # Collect all sections whose path root matches the dev root.
+            # For sections without a path, fall back on module name root.
+            user = set()
+            for name, p in paths.items():
+                if p:
+                    if self._path_root(p) == dev_root:
+                        user.add(name)
+                else:
+                    if name.split('.')[0] == dev_root:
+                        user.add(name)
+            # __main__ and __parents_main__ always belong to the developer.
+            user.update(n for n in ('__main__', '__parents_main__') if n in sections)
+
+            # Extend: scan __main__'s constants for additional dev packages
+            # (apps that split across multiple top-level dirs).
+            # Accept a root only if ALL its modules share paths that are
+            # neither stdlib nor known third-party by the prefixes list.
+            main_items = list(sections.get('__main__', ()))
+            all_path_roots_in_blob = {self._path_root(p)
+                                      for p in paths.values() if p}
+            extra_roots = set()
+            for item in main_items:
+                if not isinstance(item, str):
+                    continue
+                candidate = item.split('.')[0]
+                if (candidate
+                        and candidate != dev_root
+                        and candidate in all_path_roots_in_blob
+                        and candidate not in ('__main__', '__init__',
+                                              '__builtins__', '__parents_main__')
+                        and is_main_module(candidate)):   # not in known libs
+                    extra_roots.add(candidate)
+
+            for xroot in extra_roots:
+                for name, p in paths.items():
+                    if p and self._path_root(p) == xroot:
+                        user.add(name)
+                    elif not p and name.split('.')[0] == xroot:
+                        user.add(name)
+
+            log(f"  [user-nbc] Strategy 1 — __main__ path anchor: "
+                f"dev_root={dev_root!r}"
+                + (f" + extra={sorted(extra_roots)}" if extra_roots else ""))
+            log(f"    {len(user)} developer module(s) identified "
+                f"(from {len(sections)} total)")
+            if user:
+                log(f"    Sample: {sorted(user)[:8]}")
+            self._user_sections_cache = user
+            return user
+
+        # ══ Strategy 2 & 3: path-based classification ═════════════════════
+        if path_coverage >= 0.3:
+            # 2a: absolute paths — locate stdlib base via anchor modules.
+            stdlib_base = None
+            for anchor in self._STDLIB_ANCHORS:
+                p = paths.get(anchor, '')
+                if not p or '/' not in p:
+                    continue
+                base = p.rsplit('/', 1)[0].rstrip('/')
+                if len(base) > 4:
+                    stdlib_base = base
+                    break
+
+            user   = set()
+            stdlib = set()
+            sitepkg = set()
+
+            for name, p in paths.items():
+                if not p:
+                    (user if is_main_module(name) else stdlib).add(name)
+                    continue
+                p_low = p.lower()
+
+                # site-packages → third-party
+                if any(m.lower() in p_low for m in self._SITEPACKAGES_MARKERS):
+                    sitepkg.add(name); continue
+
+                # absolute stdlib dir
+                if stdlib_base and p.startswith(stdlib_base):
+                    stdlib.add(name); continue
+                if any(m.lower() in p_low for m in self._STDLIB_PATH_MARKERS):
+                    stdlib.add(name); continue
+
+                # 2b: relative path — path root = package root name
+                # 'Crypto/Cipher/AES.py' → root='Crypto' → in KNOWN_LIB → stdlib
+                # 'myapp/core.py'         → root='myapp'  → not known   → user
+                pr = self._path_root(p)
+                if pr:
+                    (user if is_main_module(pr) else stdlib).add(name)
+                else:
+                    (user if is_main_module(name) else stdlib).add(name)
+
+            log(f"  [user-nbc] Strategy 2/3 — path analysis "
+                f"({path_coverage*100:.0f}% coverage, stdlib_base={stdlib_base!r}):")
+            log(f"    user={len(user)}  stdlib={len(stdlib)}  site-pkgs={len(sitepkg)}")
+            if user:
+                log(f"    Sample: {sorted(user)[:8]}")
+            self._user_sections_cache = user
+            return user
+
+        # ══ Strategy 4: __main__ import-graph (no paths) ══════════════════
+        log(f"  [user-nbc] Strategy 4 — __main__ import graph "
+            f"(path coverage {path_coverage*100:.0f}%) …")
+        all_roots = {name.split('.')[0] for name in sections}
+        main_items = list(sections.get('__main__', sections.get('__init__', ())))
+        candidate_roots = set()
+        for item in main_items:
+            if not isinstance(item, str):
+                continue
+            root = item.split('.')[0]
+            if (root and root in all_roots
+                    and root not in ('__main__', '__init__', '__builtins__')
+                    and is_main_module(root)):
+                candidate_roots.add(root)
+
+        if candidate_roots:
+            user = {'__main__'}
+            for name in sections:
+                if name.split('.')[0] in candidate_roots:
+                    user.add(name)
+            log(f"    roots={sorted(candidate_roots)}, {len(user)} module(s)")
+            self._user_sections_cache = user
+            return user
+
+        # ══ Strategy 5: KNOWN_LIBRARY_PREFIXES name fallback ══════════════
+        log("  [user-nbc] Strategy 5 — KNOWN_LIBRARY_PREFIXES name heuristic")
+        result = {name for name in sections if is_main_module(name)}
+        self._user_sections_cache = result
+        return result
 
     @staticmethod
     def _normalize_decoded_sections(raw_sections):
@@ -7672,6 +7902,15 @@ class StaticalyExtractor:
         manifest = []     # list of {section, rel_path, has_class_def}
         mt_by_name = {e.get('name'): e for e in self.module_table} if self.module_table else {}
 
+        user_nbc_filter = getattr(self, 'user_nbc', False)
+        if user_nbc_filter:
+            user_set = self._find_user_sections(sections)
+            filtered_sections = {k: v for k, v in sections.items() if k in user_set}
+            skipped = len(sections) - len(filtered_sections)
+            log(f"  --user-nbc: keeping {len(filtered_sections)} developer module(s), "
+                f"skipping {skipped} stdlib/third-party")
+            sections = filtered_sections
+
         for name, items in sections.items():
             if not items:
                 continue
@@ -7828,6 +8067,15 @@ class StaticalyExtractor:
             rel = self._section_name_to_module_path(name)
             return omni_dir / (rel[:-3] + '.nbc' if rel.endswith('.py') else rel + '.nbc')
 
+        user_nbc_filter = getattr(self, 'user_nbc', False)
+        if user_nbc_filter:
+            user_set = self._find_user_sections(sections)
+            filtered_sections = {k: v for k, v in sections.items() if k in user_set}
+            skipped = len(sections) - len(filtered_sections)
+            log(f"  --user-nbc: keeping {len(filtered_sections)} developer module(s) "
+                f"(placeholders), skipping {skipped} stdlib/third-party")
+            sections = filtered_sections
+
         for name, items in sections.items():
             items_list = list(items)
             if not CAPSTONE_AVAILABLE:
@@ -7913,6 +8161,20 @@ class StaticalyExtractor:
                    if e.get('func_ptr')
                    and 'BYTECODE' not in e.get('flag_names', [])
                    and 'EXTENSION' not in e.get('flag_names', [])]
+
+        # --user-nbc: filter to developer modules identified by _find_user_sections.
+        # Re-use the cached result computed by omni_reconstruct/emit_nbc_placeholders
+        # (same run); if not yet computed, compute now using the provided sections.
+        if getattr(self, 'user_nbc', False):
+            user_names = self._user_sections_cache
+            if user_names is None and sections:
+                user_names = self._find_user_sections(sections)
+            if user_names is not None:
+                before = len(targets)
+                targets = [e for e in targets if e.get('name') in user_names]
+                log(f"  --user-nbc: {len(targets)} developer module(s) selected "
+                    f"for disassembly (skipped {before - len(targets)} library entries)")
+
         if max_modules:
             targets = targets[:max_modules]
 
@@ -9300,7 +9562,7 @@ class NuitkalizatorPro:
 
     def __init__(self, target_path: str, output_dir: str, main_only: bool = False,
                  only_modules=None, decompile_pyc: bool = True,
-                 nbc_only: bool = False):
+                 nbc_only: bool = False, user_nbc: bool = False):
         self.target = target_path
         self.output_dir = output_dir
         self.main_only = main_only
@@ -9310,6 +9572,8 @@ class NuitkalizatorPro:
         self.only_modules = only_modules
         self.decompile_pyc = decompile_pyc
         self.nbc_only = nbc_only
+        # When True, NBC generation is restricted to user (non-stdlib) modules.
+        self.user_nbc = user_nbc
         self.bypass = CommercialBypass()
         self.report = {
             'target': os.path.basename(target_path),
@@ -9644,6 +9908,7 @@ class NuitkalizatorPro:
                 )
                 if getattr(self, 'only_modules', None):
                     extractor.only_modules = self.only_modules
+                extractor.user_nbc = getattr(self, 'user_nbc', False)
                 st_result = extractor.run(st_dir)
                 log_ok(f"Staticaly sections decoded         : {st_result['sections']}")
                 log_ok(f"Staticaly .nbc files produced     : {st_result.get('nbc_files', 0)}")
@@ -10101,6 +10366,7 @@ class NuitkalizatorPro:
                 # disassembly to a user-specified subset of modules.
                 if getattr(self, 'only_modules', None):
                     extractor.only_modules = self.only_modules
+                extractor.user_nbc = getattr(self, 'user_nbc', False)
                 st_result = extractor.run(st_dir)
                 log_ok(f"Staticaly sections decoded         : {st_result['sections']}")
                 log_ok(f"Staticaly raw-scan .pyc extracted : {st_result['raw_scan_pyc']}")
@@ -10858,6 +11124,10 @@ DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
     parser.add_argument('--nbc-only', action='store_true',
                         help='Fast path: generate AI-ready .nbc only; skips source scans, '
                              '.pyc/.py/.c outputs, secrets reports, and .pyc decompilation.')
+    parser.add_argument('--user-nbc', action='store_true', dest='user_nbc',
+                        help='Restrict .nbc extraction to user/developer modules only — '
+                             'excludes Python stdlib and known third-party libraries. '
+                             'Useful when you want only the app\'s own code, not numpy/requests/etc.')
 
     # --- dynamic injection ---
     inj = parser.add_argument_group('Dynamic injection (--inject required to enable)')
@@ -10957,6 +11227,7 @@ DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
             only_modules=only_list,
             decompile_pyc=not (args.no_pyc_decompile or args.nbc_only),
             nbc_only=args.nbc_only,
+            user_nbc=args.user_nbc,
         )
         success = engine.run()
 
