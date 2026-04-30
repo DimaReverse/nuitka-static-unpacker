@@ -1441,6 +1441,42 @@ KNOWN_LIBRARY_PREFIXES = [
     'can', 'cantools',
     'Xlib', 'ewmh',
     'dbus', 'gi', 'cairo', 'pango',
+    # Type / annotation helpers
+    'typing_extensions', 'typing_inspect', 'mypy_extensions', 'annotated_types',
+    'exceptiongroup',
+    # Compression
+    'brotli', 'brotlicffi', 'zstandard', 'lz4', 'snappy', 'cramjam',
+    # Proxy / socks
+    'socks', 'sockshandler', 'PySocks',
+    # pywin32 full suite (all sub-modules)
+    'pywintypes', 'win32timezone', 'winerror', 'commctrl', 'pywin32_system32',
+    'win32print', 'win32event', 'win32file', 'win32pipe', 'win32clipboard',
+    'win32console', 'win32job', 'win32net', 'win32cred', 'win32crypt',
+    'win32transaction', 'win32help', 'win32profile', 'win32ts',
+    'win32pdh', 'win32pdhutil', 'win32pdhquery',
+    'win32evtlog', 'win32evtlogutil', 'win32serviceutil', 'win32trace',
+    'win32traceutil', 'win32verstamp', 'win32wnet',
+    'ntsecuritycon', 'dde', 'msilib',
+    # Extra networking
+    'h11', 'h2', 'hpack', 'hyperframe', 'priority',
+    'proxyprotocol', 'socksio', 'trustme',
+    'sniffio', 'trio', 'exceptiongroup',
+    'wsproto', 'outcome',
+    # Extra async / concurrency
+    'async_timeout', 'async_generator', 'asyncio_mqtt',
+    # Extra parsing / formats
+    'pyparsing', 'ply', 'antlr4', 'parso',
+    'tomlkit', 'rtoml', 'tomli',
+    'jsonschema', 'jsonpointer', 'jsonpatch', 'referencing', 'rpds',
+    'pyrsistent',
+    # Extra crypto
+    'OpenSSL', 'pyOpenSSL', 'truststore', 'service_identity',
+    'pyasn1', 'pyasn1_modules', 'rsa', 'ecdsa',
+    'asn1crypto', 'oscrypto',
+    # Extra misc
+    'sortedcontainers', 'intervaltree',
+    'exifread', 'piexif',
+    'Nuitka',
     # Nuitka internal helpers (not developer code)
     'tkinter-preLoad', 'tkinter_preLoad',
 ]
@@ -7549,136 +7585,214 @@ class StaticalyExtractor:
     def _find_user_sections(self, sections: dict) -> set:
         """Return the set of section names that belong to the developer's own code.
 
-        Nuitka's Nuitka_MetaPathBasedLoaderEntry has NO flag to distinguish
-        developer modules from stdlib/third-party. The only reliable signal is
-        co_filename — the original source path embedded in each module's blob.
+        Nuitka has NO binary flag to distinguish developer modules from
+        stdlib/third-party.  We use a 4-strategy cascade:
 
-        Strategies (cascaded, stops at first confident result):
-
-          1. __main__ path anchor — dev_root from __main__'s co_filename
-             1a. Packaged project: __main__ path = 'myapp/__main__.py'
-                 → dev_root='myapp', keep only modules under that root
-             1b. Flat project: __main__ path = '__main__.py' or 'main.py'
-                 → dev code = bare root-level .py files (no package prefix)
-          2. Absolute path markers — site-packages / stdlib dir detection
-          3. Path-root clustering — roots with many sub-modules are libraries
+          1. __main__ co_filename anchor
+             1a  Packaged: 'myapp/__main__.py' or 'C:/project/myapp/__main__.py'
+                 → dev_root = 'myapp' (relative first dir OR absolute parent dir
+                   of __main__.py, cross-checked against module table)
+             1b  Flat: '__main__.py' with no directory component
+                 → dev code = flat .py files that pass is_dev()
+          2. __main__ import-graph
+             Walk __main__'s string constants; roots that exist in the blob AND
+             pass is_dev() are the developer's packages.  is_dev() uses
+             KNOWN_LIBRARY_PREFIXES + sys.stdlib_module_names + embedded PyPI
+             metadata, so PIL / customtkinter / cv2 etc. are excluded even when
+             __main__ directly imports them.
+             Also collects flat .py files (no directory in path) as developer code.
+          3. Path-marker analysis  (absolute paths with stdlib/site-packages markers)
           4. KNOWN_LIBRARY_PREFIXES name fallback
         """
         if self._user_sections_cache is not None:
             return self._user_sections_cache
 
-        # ── collect co_filename for every section ──────────────────────────
-        paths = {}   # name -> normalised forward-slash path string (may be '')
+        # ── unified is_dev predicate ───────────────────────────────────────
+        pypi_mods    = self._extract_pypi_modules(sections)
+        stdlib_names = getattr(sys, 'stdlib_module_names',
+                               frozenset(self._STDLIB_ANCHORS))
+
+        # Nuitka-generated internal module names: underscore + 8+ hex digits.
+        # Examples: _5930d51333, _96066c68ed — never developer code.
+        import re as _re
+        _nuitka_hash = _re.compile(r'^_[0-9a-f]{8,}$').match
+
+        _NUITKA_INTERNALS = frozenset({
+            '__module_root__', '__module_root',
+            '__init__helper__', 'tkinter-preLoad', 'tkinter_preLoad',
+        })
+
+        def is_dev(name: str) -> bool:
+            root = name.split('.')[0]
+            if root in _NUITKA_INTERNALS: return False
+            if _nuitka_hash(root):        return False   # _5930d51333 etc.
+            if root in pypi_mods:         return False
+            if root in stdlib_names:      return False
+            return is_main_module(name)                  # KNOWN_LIBRARY_PREFIXES
+
+        # ── co_filename map ────────────────────────────────────────────────
+        paths: dict = {}
         for name, items in sections.items():
             paths[name] = self._py_path_from_constants(items)
 
-        has_paths = sum(1 for p in paths.values() if p)
-        path_coverage = has_paths / max(len(sections), 1)
+        has_paths      = sum(1 for p in paths.values() if p)
+        path_coverage  = has_paths / max(len(sections), 1)
+        all_sect_roots = {name.split('.')[0] for name in sections}
 
-        # ── count modules per path root ────────────────────────────────────
-        from collections import Counter
-        root_counts = Counter()  # path_root -> number of sections with that root
-        for name, p in paths.items():
-            pr = self._path_root(p) if p else ''
-            if pr:
-                root_counts[pr] += 1
+        # ── helper: package name from any path (relative OR absolute) ──────
+        def _pkg_from_path(p: str) -> str:
+            """Return the top-level package directory, or '' for flat files.
 
-        # ══ Strategy 1: Infallible PyPI Metadata Extraction ═══════════════
-        pypi_mods = self._extract_pypi_modules(sections)
-        if pypi_mods:
-            import sys
-            stdlib_names = getattr(sys, 'stdlib_module_names', frozenset(self._STDLIB_ANCHORS))
-            
-            user = set()
-            stdlib = set()
-            third_party = set()
+            Relative 'myapp/core.py'           → 'myapp'
+            Relative 'utils.py'                → '' (flat)
+            Absolute 'C:/proj/myapp/f.py'      → 'myapp' (parent dir, if in blob)
+            Absolute '/home/dev/proj/myapp/f.py'→ 'myapp' (same rule)
+            """
+            if not p:
+                return ''
+            parts = p.split('/')
+            first = parts[0]
+            # Relative path with a real directory component
+            if first and not (len(first) == 2 and first[1] == ':'):
+                if len(parts) == 1:
+                    return ''          # flat file  e.g. 'utils.py'
+                root = first
+                if root.endswith('.py'):
+                    return ''          # shouldn't happen but guard anyway
+                return root
+            # Absolute path (Linux '' first part, or Windows 'C:' drive)
+            # Best signal: parent directory of the .py file, if it exists
+            # as a top-level module root in the blob.
+            if len(parts) >= 2 and parts[-1].endswith('.py'):
+                parent = parts[-2]
+                if parent and parent in all_sect_roots and is_dev(parent):
+                    return parent
+            return ''
 
-            for name in sections:
-                root_name = name.split('.')[0]
-                
-                if root_name in pypi_mods:
-                    third_party.add(name)
-                    continue
-                    
-                if root_name in stdlib_names:
-                    stdlib.add(name)
-                    continue
-                    
-                if any(m.lower() in paths.get(name, '').lower() for m in self._STDLIB_PATH_MARKERS):
-                    stdlib.add(name)
-                    continue
-                    
-                user.add(name)
+        def _is_flat_path(p: str) -> bool:
+            """True when p is a bare filename with no directory component."""
+            return bool(p) and len(p.split('/')) == 1
 
-            user.update(n for n in ('__main__', '__parents_main__') if n in sections)
-            user.discard('__module_root__')
-            
-            log(f"  [user-nbc] Strategy 1 — Infallible PyPI Metadata Extraction:")
-            log(f"    user={len(user)}  stdlib={len(stdlib)}  PyPI={len(third_party)}")
-            if user:
-                log(f"    Developer Modules: {sorted(user)[:12]}")
-            self._user_sections_cache = user
-            return user
-
-        # ══ Strategy 2: __main__ path anchor ══════════════════════════════
-        main_path = paths.get('__main__', '') or paths.get('__parents_main__', '')
-        dev_root = self._path_root(main_path) if main_path else ''
+        # ══ Strategy 1: __main__ co_filename anchor ════════════════════════
+        main_path = (paths.get('__main__', '') or
+                     paths.get('__parents_main__', ''))
+        dev_root  = _pkg_from_path(main_path)
 
         if dev_root:
-            # ── 2a: packaged project ──────────────────────────────────────
-            # __main__ lives inside a package (e.g. 'myapp/__main__.py').
-            # Developer modules = those whose co_filename path root == dev_root.
+            # 1a — packaged project ----------------------------------------
+            # Discover additional developer roots imported by __main__
+            main_items   = list(sections.get('__main__', ()))
+            extra_roots  = set()
+            for item in main_items:
+                if not isinstance(item, str):
+                    continue
+                r = item.split('.')[0]
+                if (r and r != dev_root
+                        and r in all_sect_roots
+                        and is_dev(r)
+                        and r not in ('__main__', '__init__',
+                                      '__builtins__', '__parents_main__')):
+                    extra_roots.add(r)
+            accepted = {dev_root} | extra_roots
+
             user = set()
             for name, p in paths.items():
-                if p:
-                    if self._path_root(p) == dev_root:
-                        user.add(name)
-                else:
-                    # No path: match by module-name root
-                    if name.split('.')[0] == dev_root:
-                        user.add(name)
-            user.update(n for n in ('__main__', '__parents_main__') if n in sections)
+                pkg = _pkg_from_path(p) if p else name.split('.')[0]
+                if pkg in accepted:
+                    user.add(name)
+                elif p and _is_flat_path(p) and is_dev(name):
+                    user.add(name)          # flat dev file alongside package
+                elif not p and name.split('.')[0] in accepted:
+                    user.add(name)          # no-path module in accepted root
+            user.update(n for n in ('__main__', '__parents_main__')
+                        if n in sections)
 
-            log(f"  [user-nbc] Strategy 2a — packaged project: "
-                f"dev_root={dev_root!r}")
-            log(f"    {len(user)} developer module(s) identified "
-                f"(from {len(sections)} total)")
-            if user:
-                log(f"    Sample: {sorted(user)[:8]}")
+            log(f"  [user-nbc] Strategy 1a — packaged: dev_root={dev_root!r}"
+                + (f" + extra={sorted(extra_roots)}" if extra_roots else ""))
+            log(f"    {len(user)} developer module(s) (from {len(sections)} total)")
+            if user: log(f"    Sample: {sorted(user)[:8]}")
             self._user_sections_cache = user
             return user
 
-        if main_path and not dev_root:
-            # ── 2b: flat project ──────────────────────────────────────────
-            # __main__ path is a bare filename like '__main__.py' or 'main.py'
-            # (no package prefix → _path_root returns '').
-            # Developer code = modules whose co_filename is also a bare .py
-            # (no directory separator) and whose name is NOT a known library.
-            user = set()
-            for name, p in paths.items():
-                if p:
-                    pr = self._path_root(p)
-                    if not pr:
-                        # Bare .py file at root level — likely dev code
-                        if is_main_module(name):
-                            user.add(name)
-                    # pr != '' means it's inside a package → library
-                else:
-                    # No path at all — use name-based classification
-                    if is_main_module(name) and root_counts.get(name.split('.')[0], 0) <= 2:
-                        user.add(name)
-            user.update(n for n in ('__main__', '__parents_main__') if n in sections)
-
-            log(f"  [user-nbc] Strategy 2b — flat project: "
-                f"main_path={main_path!r}")
-            log(f"    {len(user)} developer module(s) identified "
-                f"(from {len(sections)} total)")
-            if user:
-                log(f"    Sample: {sorted(user)[:8]}")
+        if main_path and _is_flat_path(main_path):
+            # 1b — flat project: __main__.py at root, no package dir ---------
+            # Use __main__'s import graph instead of "all flat is_dev files".
+            # Extension modules and single-file third-party packages also have
+            # flat paths or no paths, so just passing is_dev() is not enough.
+            # The import graph uses KNOWN_LIBRARY_PREFIXES to exclude PIL,
+            # brotli, socks, pywintypes etc. even when __main__ imports them.
+            _1b_items = list(sections.get('__main__',
+                             sections.get('__parents_main__', ())))
+            _1b_roots = set()
+            for _item in _1b_items:
+                if not isinstance(_item, str):
+                    continue
+                _r = _item.split('.')[0]
+                if (_r and _r in all_sect_roots and is_dev(_r)
+                        and _r not in ('__main__', '__init__',
+                                       '__builtins__', '__parents_main__',
+                                       '__module_root__')):
+                    _1b_roots.add(_r)
+            user = {n for n in ('__main__', '__parents_main__') if n in sections}
+            for _name in sections:
+                _root = _name.split('.')[0]
+                if _root in _1b_roots:
+                    # _1b_roots were verified against is_dev() and the module
+                    # table, so ALL sub-modules under a discovered dev root are
+                    # developer code regardless of path depth.
+                    user.add(_name)
+            log(f"  [user-nbc] Strategy 1b — flat project import graph: "
+                f"roots={sorted(_1b_roots)}, {len(user)} dev module(s)")
             self._user_sections_cache = user
             return user
 
-        # ══ Strategy 3: path-based classification ═════════════════════════
+        # ══ Strategy 2: __main__ import-graph ═════════════════════════════
+        # When __main__ has no path (or absolute path we couldn't resolve),
+        # scan its string constants for package roots that:
+        #   • exist in the module table (all_sect_roots)
+        #   • pass is_dev()  ← excludes PIL, customtkinter, cv2, etc.
+        # This works even when __main__ directly imports third-party libraries,
+        # because those are in KNOWN_LIBRARY_PREFIXES and fail is_dev().
+        main_items      = list(sections.get('__main__',
+                               sections.get('__parents_main__', ())))
+        candidate_roots = set()
+        for item in main_items:
+            if not isinstance(item, str):
+                continue
+            r = item.split('.')[0]
+            if (r and r in all_sect_roots and is_dev(r)
+                    and r not in ('__main__', '__init__',
+                                  '__builtins__', '__parents_main__')):
+                candidate_roots.add(r)
+
+        # Flat dev files: only include flat .py files whose name root is in
+        # candidate_roots (i.e. __main__ imports them AND they pass is_dev).
+        # We do NOT include ALL flat is_dev files here because extension modules
+        # and single-file third-party packages are also flat with no path.
+        flat_devs = {name for name, p in paths.items()
+                     if p and _is_flat_path(p) and is_dev(name)
+                     and name.split('.')[0] in candidate_roots}
+
+        if candidate_roots or flat_devs:
+            user = set()
+            for name in sections:
+                if name.split('.')[0] in candidate_roots:
+                    user.add(name)
+            user.update(flat_devs)
+            # no-path modules whose name root is in candidate_roots
+            for name, p in paths.items():
+                if not p and is_dev(name) and name.split('.')[0] in candidate_roots:
+                    user.add(name)
+            user.update(n for n in ('__main__', '__parents_main__')
+                        if n in sections)
+            log(f"  [user-nbc] Strategy 2 — import graph: "
+                f"roots={sorted(candidate_roots)}, flat={len(flat_devs)}")
+            log(f"    {len(user)} developer module(s) (from {len(sections)} total)")
+            if user: log(f"    Sample: {sorted(user)[:8]}")
+            self._user_sections_cache = user
+            return user
+
+        # ══ Strategy 3: path-marker analysis (absolute paths) ══════════════
         if path_coverage >= 0.3:
             stdlib_base = None
             for anchor in self._STDLIB_ANCHORS:
@@ -7690,55 +7804,43 @@ class StaticalyExtractor:
                     stdlib_base = base
                     break
 
-            user   = set()
-            stdlib = set()
+            user    = set()
+            stdlib  = set()
             sitepkg = set()
-
             for name, p in paths.items():
+                if not is_dev(name):
+                    stdlib.add(name); continue
                 if not p:
-                    (user if is_main_module(name) else stdlib).add(name)
-                    continue
+                    user.add(name); continue
                 p_low = p.lower()
-
-                # site-packages → third-party
                 if any(m.lower() in p_low for m in self._SITEPACKAGES_MARKERS):
                     sitepkg.add(name); continue
-
-                # absolute stdlib dir
                 if stdlib_base and p.startswith(stdlib_base):
                     stdlib.add(name); continue
                 if any(m.lower() in p_low for m in self._STDLIB_PATH_MARKERS):
                     stdlib.add(name); continue
-
-                pr = self._path_root(p)
-                if pr:
-                    # Trust is_main_module() with the expanded
-                    # KNOWN_LIBRARY_PREFIXES list — it covers stdlib +
-                    # ~200 common PyPI packages.
-                    (user if is_main_module(pr) else stdlib).add(name)
+                pkg = _pkg_from_path(p)
+                if pkg:
+                    (user if is_dev(pkg) else stdlib).add(name)
                 else:
-                    # Bare file at root level
-                    (user if is_main_module(name) else stdlib).add(name)
+                    user.add(name)       # flat file → developer
 
-            # __main__ and __parents_main__ ALWAYS belong to the developer.
-            user.update(n for n in ('__main__', '__parents_main__') if n in sections)
-            stdlib.discard('__main__')
-            stdlib.discard('__parents_main__')
-            # __module_root__ is a Nuitka internal, not developer code.
+            user.update(n for n in ('__main__', '__parents_main__')
+                        if n in sections)
+            stdlib.discard('__main__'); stdlib.discard('__parents_main__')
             user.discard('__module_root__')
 
-            log(f"  [user-nbc] Strategy 3 — path analysis "
-                f"({path_coverage*100:.0f}% coverage, stdlib_base={stdlib_base!r}):")
-            log(f"    user={len(user)}  stdlib={len(stdlib)}  site-pkgs={len(sitepkg)}")
-            if user:
-                log(f"    Modules: {sorted(user)[:12]}")
+            log(f"  [user-nbc] Strategy 3 — path markers "
+                f"({path_coverage*100:.0f}%, stdlib_base={stdlib_base!r}):")
+            log(f"    user={len(user)}  stdlib={len(stdlib)}  "
+                f"site-pkgs={len(sitepkg)}  pypi_meta={len(pypi_mods)}")
+            if user: log(f"    Sample: {sorted(user)[:12]}")
             self._user_sections_cache = user
             return user
 
         # ══ Strategy 4: KNOWN_LIBRARY_PREFIXES name fallback ══════════════
-        log("  [user-nbc] Strategy 4 — KNOWN_LIBRARY_PREFIXES name heuristic "
-            f"(path coverage {path_coverage*100:.0f}%)")
-        result = {name for name in sections if is_main_module(name)}
+        log(f"  [user-nbc] Strategy 4 — name fallback (pypi_meta={len(pypi_mods)})")
+        result = {name for name in sections if is_dev(name)}
         self._user_sections_cache = result
         return result
 
