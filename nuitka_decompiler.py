@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NUITKA STATIC UNPACKER - Static-first Nuitka unpacker (authorized research tool) v7.3
+NUITKA STATIC UNPACKER - Static-first Nuitka unpacker (authorized research tool) v7.8
 by dimareverse
 
 Static mode is the default: no runtime hooks, no injection.
@@ -2755,10 +2755,10 @@ class NuitkaModuleTableParser:
             return False
         return True
 
-    def find_table(self, extra_names=None):
+    def find_table(self, extra_names=None, bc_index_to_name=None):
         """Locate the module table and return the full entry list.
 
-        Strategy (3 passes, combined):
+        Strategy (4 passes, combined):
 
           1. **Primary cluster scan** — identical to the original: walk every
              8-byte offset in .data/.rdata, follow contiguous records and
@@ -2781,6 +2781,21 @@ class NuitkaModuleTableParser:
              isolated entries like `__main__` that live outside the main
              cluster because Nuitka's loader-codes generator sometimes
              emits them in a sidecar array.
+
+          4. **Function-pointer cluster scan** (commercial / data-hiding builds) —
+             when passes 1-3 recover nothing (because module name strings are
+             fully hidden or stored outside .data/.rdata), scan .data/.rdata
+             for 32-byte-aligned clusters where the func_ptr field (offset 8 in
+             x64) is a valid .text address. This recovers func_ptrs without
+             needing name strings at all. Names are then recovered from the
+             `bc_index_to_name` mapping (derived from the already-decrypted blob
+             chunk list via the bytecode_index field), or left as '<unknown_N>'.
+
+        Args:
+            extra_names:      list of module names known to exist (from blob chunks).
+            bc_index_to_name: dict {bytecode_index: module_name} built from the
+                              decrypted blob so Pass 4 can recover names even when
+                              the PE stores them encrypted.
 
         Returns `(start_va, entries)` or `None`.
         """
@@ -2952,7 +2967,126 @@ class NuitkaModuleTableParser:
                     ]
                     best = (best[0], merged)
 
+        # ---------- Pass 4 — func_ptr cluster scan (commercial / data-hiding) ----------
+        #
+        # When passes 1-3 find nothing (e.g. all name strings are encrypted or
+        # stored outside .data/.rdata by the data-hiding plugin), we scan for
+        # clusters of 32-byte records where the func_ptr field points into .text.
+        # No name strings needed — we recover names from bc_index_to_name instead.
+        if best is None:
+            fp_result = self._find_table_by_funcptr(sections_info, bc_index_to_name)
+            if fp_result:
+                best = fp_result
+
         return best
+
+    def _find_table_by_funcptr(self, sections_info, bc_index_to_name=None):
+        """Pass 4: find module table by scanning for func_ptr clusters.
+
+        Does not depend on name strings being present in .data/.rdata.
+        For each 32-byte-aligned window in .data/.rdata where the func_ptr
+        field (offset 8 on x64, offset 4 on x86) is a valid .text VA, walk
+        forward to find the longest consecutive cluster.  Names are recovered
+        from bc_index_to_name when available; otherwise set to '<unknown_N>'.
+        Returns (start_va, entries) or None.
+        """
+        MIN_CLUSTER = 5  # minimum entries to accept as a real table
+
+        # Build set of valid .text VA ranges
+        text_lo, text_hi = 0, 0
+        for section in self.pe.sections:
+            sn = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+            if sn == '.text':
+                base = self.image_base + section.VirtualAddress
+                sz   = section.SizeOfRawData
+                if sz > text_hi - text_lo:
+                    text_lo, text_hi = base, base + sz
+
+        if text_hi == 0:
+            return None
+
+        def is_text(va):
+            return text_lo <= va < text_hi
+
+        ptr_fmt  = '<Q' if self.is_x64 else '<I'
+        ptr_size = self.ptr_size
+        rec      = self.record_size
+        fp_off   = ptr_size   # func_ptr is immediately after name_ptr
+
+        best_cluster = None
+        best_len     = 0
+
+        for info in sections_info:
+            sec_data = info['data']
+            sec_size = len(sec_data)
+            base_va  = info['base_va']
+
+            off = 0
+            while off <= sec_size - rec:
+                # Quick pre-check: func_ptr field must be a .text VA
+                if off + fp_off + ptr_size > sec_size:
+                    off += 8
+                    continue
+                fp_val = struct.unpack_from(ptr_fmt, sec_data, off + fp_off)[0]
+                if not is_text(fp_val):
+                    off += 8
+                    continue
+
+                # Walk forward collecting entries
+                cluster   = []
+                run_off   = off
+                idx_seq   = 0   # sequential index for unknown-name fallback
+
+                while run_off + rec <= sec_size:
+                    if self.is_x64:
+                        fp  = struct.unpack_from('<Q', sec_data, run_off + 8)[0]
+                        bci = struct.unpack_from('<i', sec_data, run_off + 16)[0]
+                        bcs = struct.unpack_from('<i', sec_data, run_off + 20)[0]
+                        flg = struct.unpack_from('<I', sec_data, run_off + 24)[0]
+                    else:
+                        fp  = struct.unpack_from('<I', sec_data, run_off + 4)[0]
+                        bci = struct.unpack_from('<i', sec_data, run_off + 8)[0]
+                        bcs = struct.unpack_from('<i', sec_data, run_off + 12)[0]
+                        flg = struct.unpack_from('<I', sec_data, run_off + 16)[0]
+
+                    # Terminator row: everything zero
+                    if fp == 0 and bci == 0 and bcs == 0 and flg == 0:
+                        break
+
+                    # Validate fields
+                    if fp != 0 and not is_text(fp):
+                        break
+                    if bci < -1 or bci > 200_000:
+                        break
+                    if bcs < 0 or bcs > 100_000_000:
+                        break
+                    if flg > 0xFF:
+                        break
+
+                    # Recover name: bc_index_to_name > positional fallback
+                    if bc_index_to_name and bci >= 0 and bci in bc_index_to_name:
+                        name = bc_index_to_name[bci]
+                    else:
+                        name = f'<unknown_{idx_seq}>'
+
+                    cluster.append({
+                        'name':           name,
+                        'func_ptr':       fp,
+                        'bytecode_index': bci,
+                        'bytecode_size':  bcs,
+                        'flags':          flg,
+                        'flag_names':     self._decode_flags(flg),
+                    })
+                    run_off += rec
+                    idx_seq += 1
+
+                if len(cluster) >= MIN_CLUSTER and len(cluster) > best_len:
+                    best_len     = len(cluster)
+                    best_cluster = (base_va + off, cluster)
+
+                off = run_off if cluster else off + 8
+
+        return best_cluster
 
     def _read_record_permissive(self, sec_data, off, all_strings):
         """Relaxed version of _read_record that accepts ANY string (not
@@ -5474,16 +5608,99 @@ class NuitkaCompactEmitter:
             out.append(f'  # omitted {omitted} low-signal native instruction(s)')
         out.append('')
 
+    # Names that look like module candidates but are actually built-in
+    # method names, built-in functions, or common variable names that
+    # Nuitka stores as constants adjacent to varname tuples.  A string
+    # matching any of these must never be treated as an import source.
+    _NOT_A_MODULE = frozenset({
+        # str methods
+        'strip', 'lstrip', 'rstrip', 'split', 'rsplit', 'splitlines',
+        'join', 'find', 'rfind', 'index', 'rindex', 'count', 'replace',
+        'startswith', 'endswith', 'encode', 'decode', 'format',
+        'format_map', 'upper', 'lower', 'title', 'capitalize', 'swapcase',
+        'center', 'ljust', 'rjust', 'zfill', 'expandtabs',
+        'isalpha', 'isdigit', 'isalnum', 'isspace', 'islower', 'isupper',
+        'istitle', 'isprintable', 'isidentifier', 'isnumeric',
+        'removeprefix', 'removesuffix', 'partition', 'rpartition',
+        # list / dict / set methods
+        'append', 'extend', 'insert', 'remove', 'pop', 'clear', 'copy',
+        'sort', 'reverse', 'index', 'count',
+        'keys', 'values', 'items', 'get', 'update', 'setdefault',
+        'add', 'discard', 'difference', 'intersection', 'union',
+        # built-in functions
+        'len', 'str', 'int', 'float', 'bool', 'list', 'dict', 'set',
+        'tuple', 'type', 'print', 'repr', 'sorted', 'reversed',
+        'enumerate', 'zip', 'map', 'filter', 'any', 'all',
+        'min', 'max', 'sum', 'abs', 'round', 'divmod', 'pow',
+        'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
+        'delattr', 'callable', 'hash', 'id', 'iter', 'next',
+        'open', 'input', 'vars', 'dir', 'help', 'exec', 'eval',
+        'compile', 'globals', 'locals', 'chr', 'ord', 'hex', 'oct', 'bin',
+        'range', 'slice', 'object', 'super', 'property', 'staticmethod',
+        'classmethod', 'bytes', 'bytearray', 'memoryview', 'complex',
+        'frozenset', 'format', 'vars', 'breakpoint', 'reload',
+        # common variable / attribute names that appear as constants
+        'convert', 'squeeze', 'reshape', 'flatten', 'transpose',
+        'split', 'merge', 'concat', 'apply', 'transform', 'fit',
+        'predict', 'run', 'start', 'stop', 'close', 'open', 'read',
+        'write', 'send', 'recv', 'connect', 'bind', 'listen', 'accept',
+        'getenv', 'environ', 'getcwd', 'chdir', 'listdir', 'makedirs',
+        'remove', 'rename', 'walk', 'glob', 'expanduser', 'expandvars',
+        'basename', 'dirname', 'exists', 'isfile', 'isdir', 'join',
+        'splitext', 'abspath', 'realpath', 'normpath',
+        'search', 'match', 'fullmatch', 'findall', 'finditer', 'sub',
+        'subn', 'compile', 'escape', 'purge',
+        'dumps', 'loads', 'dump', 'load',
+        'sleep', 'time', 'clock', 'monotonic', 'perf_counter',
+        'strftime', 'strptime', 'now', 'today', 'utcnow', 'fromtimestamp',
+        'flush', 'seek', 'tell', 'truncate', 'fileno', 'readable',
+        'writable', 'seekable', 'readline', 'readlines', 'writelines',
+        'kill', 'signal', 'wait', 'poll', 'communicate', 'terminate',
+        'lower', 'upper', 'get', 'set', 'delete', 'head', 'post', 'put',
+        'patch', 'request', 'response', 'content', 'text', 'json',
+        'headers', 'cookies', 'params', 'data', 'files', 'auth',
+        'timeout', 'verify', 'allow_redirects', 'stream', 'proxies',
+        'raise_for_status', 'status_code', 'url', 'encoding',
+        'info', 'warn', 'error', 'debug', 'critical', 'exception',
+        'emit', 'handle', 'filter', 'addHandler', 'setLevel',
+        # numpy/array shortcuts
+        'float32', 'float64', 'int32', 'int64', 'uint8', 'uint16',
+        'zeros', 'ones', 'array', 'arange', 'linspace', 'reshape',
+        'dtype', 'shape', 'ndim', 'size', 'T', 'argmax', 'argmin',
+        # misc single-word false positives
+        'true', 'false', 'null', 'none', 'undefined',
+        'ok', 'err', 'error', 'result', 'value', 'values',
+        'key', 'keys', 'name', 'names', 'label', 'labels',
+        'node', 'nodes', 'edge', 'edges', 'path', 'paths',
+        'w', 'h', 'x', 'y', 'z', 'r', 'g', 'b', 'a',
+        'i', 'j', 'k', 'n', 'm', 's', 't', 'f', 'c', 'p', 'q',
+        'src', 'dst', 'buf', 'msg', 'log', 'out', 'inp', 'tmp',
+        'idx', 'pos', 'off', 'end', 'cur', 'prev', 'next', 'last',
+        # Qt-specific
+        'setObjectName', 'setGeometry', 'setWindowTitle', 'setStyleSheet',
+        'setEnabled', 'setVisible', 'setChecked', 'setCurrentIndex',
+        'setCurrentText', 'setText', 'setPlaceholderText', 'setMaxLength',
+        'setMinimumWidth', 'setMinimumSize', 'setDefault', 'setFocus',
+        'setProperty', 'setAlignment', 'setTextAlignment', 'setColumnStretch',
+        'setCursor', 'setDisplayFormat', 'addWidget', 'addItem',
+        'addSeparator', 'addStretch', 'setLayout',
+        'clicked', 'connect', 'emit', 'disconnect',
+        'show', 'hide', 'close', 'exec', 'move', 'resize',
+        # IRCTC / domain specific false positives
+        'toString', 'toJson', 'fromJson', 'toDict', 'fromDict',
+        'getenv', 'environ', 'getattr', 'setattr',
+    })
+
     @classmethod
     def _emit_imports(cls, module_name, constants, out):
         """Liberal import detection specifically for the .nbc output.
 
-        The strict detector inside StaticalySmartReconstructor filters
-        many true positives (`apis`, `proxyconnector`, …) to keep the
-        reconstructed `.py` file clean. For the `.nbc` we prefer maximum
-        signal: every `str 'x'` immediately followed by `tuple('A', 'B')`
-        in the constants is almost certainly `from x import A, B` —
-        emit it and let the LLM decide which are real.
+        Matches `str 'x'` immediately followed by `tuple('A','B',...)` as
+        `from x import A, B`.  A comprehensive blacklist (_NOT_A_MODULE)
+        filters out built-in method names, built-in functions, Qt widget
+        methods, and common variable names that Nuitka stores as constants
+        adjacent to varname tuples.  Without this filter, large modules like
+        __main__ generate hundreds of false `from strip import X` lines.
         """
         lines = []
         used = set()
@@ -5504,6 +5721,61 @@ class NuitkaCompactEmitter:
             parts = c.split('.')
             if parts[0][:1].isupper():
                 continue  # Class.method
+            # Reject known non-module names (methods, builtins, variables).
+            if parts[0] in cls._NOT_A_MODULE:
+                continue
+            # Single-word all-lowercase names that are not known stdlib/popular
+            # packages are highly likely to be variable names, not modules.
+            # Require at least one dot OR membership in a known-packages set
+            # OR starting underscore (internal module like _thread) to pass
+            # without a dot.
+            if len(parts) == 1 and not c.startswith('_'):
+                _KNOWN_ROOTS = {
+                    'subprocess', 're', 'os', 'sys', 'io', 'abc', 'ast',
+                    'asyncio', 'base64', 'binascii', 'builtins', 'calendar',
+                    'cmath', 'codecs', 'collections', 'concurrent', 'configparser',
+                    'contextlib', 'copy', 'copyreg', 'csv', 'ctypes',
+                    'dataclasses', 'datetime', 'decimal', 'difflib', 'dis',
+                    'email', 'enum', 'errno', 'fileinput', 'fnmatch',
+                    'fractions', 'ftplib', 'functools', 'gc', 'getopt',
+                    'getpass', 'glob', 'gzip', 'hashlib', 'heapq', 'hmac',
+                    'html', 'http', 'imaplib', 'importlib', 'inspect',
+                    'ipaddress', 'itertools', 'json', 'keyword', 'linecache',
+                    'locale', 'logging', 'lzma', 'marshal', 'math',
+                    'mimetypes', 'multiprocessing', 'numbers', 'operator',
+                    'optparse', 'os', 'pathlib', 'pickle', 'platform',
+                    'pprint', 'profile', 'pstats', 'pty', 'queue', 'random',
+                    'shlex', 'shutil', 'signal', 'site', 'socket', 'socketserver',
+                    'sqlite3', 'ssl', 'stat', 'statistics', 'string',
+                    'struct', 'subprocess', 'sys', 'sysconfig', 'tarfile',
+                    'tempfile', 'threading', 'time', 'timeit', 'tkinter',
+                    'tomllib', 'traceback', 'tracemalloc', 'types', 'typing',
+                    'unicodedata', 'unittest', 'urllib', 'uuid', 'warnings',
+                    'weakref', 'xml', 'xmlrpc', 'zipfile', 'zipimport', 'zlib',
+                    # popular third-party
+                    'requests', 'httpx', 'aiohttp', 'flask', 'django',
+                    'fastapi', 'starlette', 'pydantic', 'attrs', 'click',
+                    'celery', 'redis', 'pymongo', 'sqlalchemy', 'alembic',
+                    'numpy', 'pandas', 'scipy', 'matplotlib', 'sklearn',
+                    'tensorflow', 'torch', 'keras', 'cv2', 'PIL', 'onnxruntime',
+                    'psutil', 'paramiko', 'fabric', 'ansible', 'boto3',
+                    'selenium', 'seleniumbase', 'playwright', 'pyppeteer',
+                    'bs4', 'lxml', 'scrapy', 'mechanize',
+                    'cryptography', 'nacl', 'bcrypt', 'jwt', 'passlib',
+                    'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'PyGTK', 'wx',
+                    'pynput', 'keyboard', 'mouse', 'pyautogui', 'pygetwindow',
+                    'psycopg2', 'pymysql', 'aiomysql', 'aiosqlite',
+                    'colorama', 'rich', 'tabulate', 'tqdm', 'loguru',
+                    'yaml', 'toml', 'dotenv', 'environs',
+                    'websocket', 'websockets', 'socketio',
+                    'win32api', 'win32con', 'win32gui', 'winreg', 'ctypes',
+                    'pefile', 'capstone', 'keystone', 'unicorn',
+                    'tblib', 'dill', 'cloudpickle',
+                    # IRCTC-domain specific modules seen in constants
+                    'system_config', 'json_to_html',
+                }
+                if c not in _KNOWN_ROOTS:
+                    continue
             # Expect next const to be a tuple of idents (= the imported names)
             nxt = constants[i + 1] if i + 1 < n else None
             if (isinstance(nxt, tuple) and nxt
@@ -10122,7 +10394,19 @@ class NuitkalizatorPro:
                     continue
                 _seen.add(_n)
                 _extra_names_dedup.append(_n)
-            found = mtp.find_table(extra_names=_extra_names_dedup)
+
+            # Build bc_index_to_name: {bytecode_index -> module_name} from the
+            # already-decrypted blob. Pass 4 uses this to recover names when
+            # the PE stores them encrypted (commercial / data-hiding builds).
+            # bc_idx is the position of the chunk in the blob chunk list.
+            _bc_index_to_name = {}
+            for _bi, (_cn, _) in enumerate(module_chunks):
+                _bc_index_to_name[_bi] = _cn
+
+            found = mtp.find_table(
+                extra_names=_extra_names_dedup,
+                bc_index_to_name=_bc_index_to_name,
+            )
             if found:
                 start_va, module_table_entries = found
                 log_ok(f"Module table: {len(module_table_entries)} entries at VA 0x{start_va:X}")
@@ -10156,7 +10440,22 @@ class NuitkalizatorPro:
                     'extension_entries': len(ext_entries),
                 }
             else:
-                log_warn("Module table not located (table may be fragmented or custom)")
+                # Emit a detailed diagnostic so the user knows WHICH pass failed.
+                _str_count = 0
+                try:
+                    _diag_strings = mtp._collect_strings()
+                    _str_count = len(_diag_strings)
+                except Exception:
+                    pass
+                log_warn("Module table NOT located — diagnostic:")
+                log_warn(f"  Strings found in .data/.rdata : {_str_count}")
+                log_warn(f"  bc_index_to_name entries      : {len(_bc_index_to_name)}")
+                log_warn(f"  Pass 4 (func_ptr scan)        : also found nothing")
+                log_warn("  Possible causes:")
+                log_warn("    - data-hiding stores name strings outside .data/.rdata")
+                log_warn("    - func_ptrs use indirection thunks (not direct .text VAs)")
+                log_warn("    - non-standard Nuitka record size (try a different build)")
+                log_warn("  @OPS blocks will be absent; .nbc files will be constants-only.")
         except Exception as _mt_err:
             log_warn(f"Module table scan error: {_mt_err}")
 
