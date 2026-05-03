@@ -77,32 +77,39 @@ def _find_blob_in_pe(path: str) -> tuple[bytes | None, str]:
             pe = pefile.PE(data=data, fast_load=False)
             pe.parse_data_directories()
 
-            # Try PE resources first
+            # Try PE resources: specifically RT_RCDATA (type=10) / ID 3
+            # (same logic as extract_pe_constants_blob in nuitka_decompiler.py)
             if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
                 for res_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+                    if res_type.id != 10:  # RT_RCDATA only
+                        continue
                     for res_id in res_type.directory.entries:
+                        if res_id.id != 3:  # Nuitka constants ID
+                            continue
                         for res_lang in res_id.directory.entries:
                             rva = res_lang.data.struct.OffsetToData
                             size = res_lang.data.struct.Size
                             try:
                                 chunk = pe.get_data(rva, size)
                                 if len(chunk) >= 8:
-                                    return chunk, "PE resource"
+                                    return chunk, "PE RT_RCDATA/3"
                             except Exception:
                                 pass
 
-            # Try sections: look for one that starts with CRC+size pattern
+            # Try sections: scan for CRC-verified blob (open-source builds use incbin)
             for section in pe.sections:
-                raw = data[section.PointerToRawData:
-                           section.PointerToRawData + section.SizeOfRawData]
-                if len(raw) >= 8:
-                    declared = struct.unpack_from("<I", raw, 4)[0]
-                    if 8 + declared <= len(raw) <= 8 + declared + 4096:
-                        actual_crc = zlib.crc32(raw[8:8 + declared]) & 0xFFFFFFFF
-                        stored_crc = struct.unpack_from("<I", raw, 0)[0]
-                        if actual_crc == stored_crc:
-                            sec_name = section.Name.rstrip(b'\x00').decode('ascii', 'replace')
-                            return raw, f"section {sec_name}"
+                sec_data = section.get_data()
+                for off in range(0, len(sec_data) - 8, 4):
+                    declared = struct.unpack_from("<I", sec_data, off + 4)[0]
+                    if declared < 1000 or declared > 50_000_000:
+                        continue
+                    if off + 8 + declared > len(sec_data):
+                        continue
+                    actual_crc = zlib.crc32(sec_data[off + 8:off + 8 + declared]) & 0xFFFFFFFF
+                    stored_crc = struct.unpack_from("<I", sec_data, off)[0]
+                    if actual_crc == stored_crc:
+                        sec_name = section.Name.rstrip(b'\x00').decode('ascii', 'replace')
+                        return bytes(sec_data[off:off + 8 + declared]), f"section {sec_name}+0x{off:X}"
 
         except Exception:
             pass
@@ -147,7 +154,7 @@ def _parse_module_names(blob: bytes, is_commercial: bool) -> list[dict]:
     modules = []
 
     while offset < len(data) - 5:
-        name_end = data.find(b"\x00", offset, min(offset + 512, len(data)))
+        name_end = data.find(b"\x00", offset, min(offset + 4096, len(data)))
         if name_end == -1:
             break
 
@@ -206,14 +213,26 @@ def list_modules(target: str,
         print("        Is this a Nuitka-compiled binary?", file=sys.stderr)
         return 1
 
+    print(f"[INFO] Blob source : {source}  ({len(blob):,} bytes)", file=sys.stderr)
+
     is_enc = _is_likely_encrypted(blob)
     is_commercial = is_enc  # encrypted → commercial build
+
+    if is_enc:
+        print("[INFO] Blob appears encrypted (CRC mismatch) — commercial/protected build",
+              file=sys.stderr)
 
     modules = _parse_module_names(blob, is_commercial)
 
     if not modules:
+        crc_s  = struct.unpack_from("<I", blob, 0)[0]
+        size_s = struct.unpack_from("<I", blob, 4)[0]
         print("[ERROR] Blob found but no modules parsed — format may be unsupported.",
               file=sys.stderr)
+        print(f"        Blob header: CRC=0x{crc_s:08X}  declared_size={size_s:,}  "
+              f"actual_blob_len={len(blob):,}", file=sys.stderr)
+        print(f"        First 32 bytes (hex): {blob[:32].hex()}", file=sys.stderr)
+        print("        Try running the full decompiler for deeper analysis.", file=sys.stderr)
         return 1
 
     # Apply filter

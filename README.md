@@ -131,6 +131,39 @@ selected modules is much cheaper than the first module.
 
 ---
 
+## What's new in v7.6
+
+### Fix + speedup: `--list-modules` now works on commercial/encrypted builds
+
+Previously `--list-modules` delegated to `list_modules.py`, which had no decryption capability. On commercial Nuitka builds (encrypted blob), it returned the error *"Blob found but no modules parsed — format may be unsupported"* even when the binary was perfectly valid.
+
+**What changed:**
+
+| Component | Before | After |
+|---|---|---|
+| `--list-modules` handler | Delegated to `list_modules.py` (no decryption) | Uses `CommercialBypass` full pipeline inline |
+| d0–d7 recovery | Always ran expensive PE disassembly scan | Derived directly from the encrypted blob digest (instant) — PE scan only as fallback |
+| `_find_all_mapping_candidates` | `set()` on every 1-byte-stepped 256-byte window — O(n·256) | Sliding-window frequency counter — O(n), ~50× faster on large sections; `.rdata`-first order |
+| `list_modules.py` blob finder | Returned first PE resource with size ≥ 8 (any type) | Specifically targets RT_RCDATA (type 10) / ID 3, then CRC-verified section scan |
+| Failure diagnostics | Generic error message | Shows blob source, size, CRC header, and first 32 hex bytes |
+
+**Fast-path logic for encrypted blobs:**
+
+1. Scan `.rdata` only for the `_mapping[]` table (no `.text` disassembly)
+2. For each candidate, call `_derive_d_from_blob` — recovers `d0-d7` directly from the encrypted digest bytes in the blob (no further PE scanning)
+3. Verify with CRC32 — done in milliseconds
+4. Only if the fast path fails: fall back to the full `extract_key_material_from_pe` scan
+
+On `PROMAX.exe` (14.8 MB encrypted blob, 1287 modules): result goes from a hard error to a complete module listing in a few seconds.
+
+```bash
+# Now works on commercial builds too
+python nuitka_decompiler.py authorized_target.exe --list-modules
+python list_modules.py authorized_target.exe
+```
+
+---
+
 ## What's new in v7.5
 
 ### New: `--user-nbc` — extract only the developer's own modules

@@ -511,28 +511,78 @@ class CommercialBypass:
         best = self._decrypt_raw(encrypted_blob, mapping_candidates[0], d_candidates[0])
         return best, mapping_candidates[0], d_candidates[0]
 
-    def _find_all_mapping_candidates(self, pe):
-        """Collect ALL _mapping[] candidates (complete 0-255 permutations)."""
-        candidates = []
+    def _find_all_mapping_candidates(self, pe, rdata_only: bool = False):
+        """Collect ALL _mapping[] candidates (complete 0-255 permutations).
 
-        for section in pe.sections:
+        Uses a O(n) sliding-window frequency counter instead of creating a new
+        set() for every 1-byte-stepped window — ~50x faster on large sections.
+        """
+        candidates = []
+        _identity = list(range(256))
+
+        # Priority order: .rdata (most likely) first, then .data, then .text
+        section_order = {'.rdata': 0, '.data': 1, '.text': 2}
+        sections_sorted = sorted(
+            pe.sections,
+            key=lambda s: section_order.get(
+                s.Name.rstrip(b'\x00').decode('ascii', errors='replace'), 3)
+        )
+
+        for section in sections_sorted:
             name = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
-            if not any(n in name for n in ('.rdata', '.data', '.text')):
+            sec_key = next((k for k in ('.rdata', '.data', '.text') if k in name), None)
+            if sec_key is None:
+                continue
+            if rdata_only and sec_key != '.rdata':
                 continue
 
             sec_data = section.get_data()
             sec_size = len(sec_data)
+            if sec_size < 256:
+                continue
 
-            for offset in range(0, sec_size - 256, 1):
-                candidate = sec_data[offset:offset + 256]
-                if len(set(candidate)) == 256:
-                    table = list(candidate)
-                    if table == list(range(256)):
-                        continue  # Identity = open-source no-op
-                    rva = section.VirtualAddress + offset
-                    if not any(c[1] == table for c in candidates):
-                        candidates.append((rva, table, name))
-                        log(f"  _mapping[] candidate at RVA 0x{rva:X} ({name}+0x{offset:X})")
+            # Sliding-window permutation check: maintain a frequency array of
+            # size 256 and a count of distinct values in the current window.
+            freq = [0] * 256
+            distinct = 0
+
+            # Initialise with first window
+            for b in sec_data[:256]:
+                if freq[b] == 0:
+                    distinct += 1
+                freq[b] += 1
+
+            def _check(offset):
+                if distinct != 256:
+                    return
+                table = list(sec_data[offset:offset + 256])
+                if table == _identity:
+                    return  # identity = open-source no-op
+                if any(c[1] == table for c in candidates):
+                    return  # deduplicate
+                rva = section.VirtualAddress + offset
+                candidates.append((rva, table, sec_key))
+                log(f"  _mapping[] candidate at RVA 0x{rva:X} ({name}+0x{offset:X})")
+
+            _check(0)
+
+            for offset in range(1, sec_size - 256):
+                # Slide: remove outgoing byte
+                out_b = sec_data[offset - 1]
+                freq[out_b] -= 1
+                if freq[out_b] == 0:
+                    distinct -= 1
+                # Add incoming byte
+                in_b = sec_data[offset + 255]
+                if freq[in_b] == 0:
+                    distinct += 1
+                freq[in_b] += 1
+
+                _check(offset)
+
+            # Found something in .rdata — skip slower sections in fast mode
+            if rdata_only and candidates:
+                break
 
         # Sort: .rdata first, then .data, then .text
         order = {'.rdata': 0, '.data': 1, '.text': 2}
@@ -11375,50 +11425,101 @@ DYNAMIC mode : authorized lab instrumentation of a running or auto-launched
     _inject_only = args.inject and (args.pid is not None or args.launch)
     # ── --list-modules early exit ──────────────────────────────────────────
     if getattr(args, 'list_modules', False):
-        import importlib.util as _ilu, pathlib as _pl
-        _lm_path = _pl.Path(__file__).parent / 'list_modules.py'
-        if _lm_path.exists():
-            spec = _ilu.spec_from_file_location('list_modules', _lm_path)
-            _lm = _ilu.module_from_spec(spec)
-            spec.loader.exec_module(_lm)
-            raise SystemExit(_lm.list_modules(
-                target,
-                as_json=False,
-                filter_str=getattr(args, 'filter_str', None),
-                copy_cmd=True,
-            ))
-        else:
-            # Fallback: inline fast path (no pefile, raw CRC scan)
-            import zlib as _zlib, struct as _st, random as _rnd
-            _data = open(target, 'rb').read()
-            _r = _rnd.Random(27); _fwd = list(range(1,256)); _r.shuffle(_fwd); _fwd.insert(0,0)
-            for _off in range(0, len(_data)-8, 4):
-                _crc = _st.unpack_from('<I', _data, _off)[0]
-                _sz  = _st.unpack_from('<I', _data, _off+4)[0]
-                if _sz < 64 or _sz > 64*1024*1024 or _off+8+_sz > len(_data): continue
-                if (_zlib.crc32(_data[_off+8:_off+8+_sz]) & 0xFFFFFFFF) != _crc: continue
-                _chunk = _data[_off+8:_off+8+_sz]; _pos = 0; _names = []
-                while _pos < len(_chunk)-5:
-                    _ne = _chunk.find(b'\x00', _pos, min(_pos+512, len(_chunk)))
-                    if _ne == -1: break
-                    _raw = _chunk[_pos:_ne]; _pos = _ne+1
-                    if _pos+4 > len(_chunk): break
-                    _cs = _st.unpack_from('<I', _chunk, _pos)[0]; _pos += 4
-                    if _cs > 64*1024*1024 or _pos+_cs > len(_chunk): break
-                    try: _n = _raw.decode('utf-8','strict')
-                    except: _n = bytes(_fwd[b] for b in _raw).decode('utf-8','replace')
-                    _names.append((_n, _cs)); _pos += _cs
-                if _names:
-                    _f = getattr(args, 'filter_str', None)
-                    print(f"\n  Found {len(_names)} modules:\n")
-                    _shown = [(_n,_s) for _n,_s in _names if not _f or _f.lower() in _n.lower()]
-                    for _i,(_n,_s) in enumerate(_shown,1):
-                        print(f"  {_i:<5} {_n:<55} {_s/1024:>7.1f} KB")
-                    _sel = ",".join(_n for _n,_ in _shown if _n != '.bytecode')
-                    print(f"\n  --only {_sel}")
-                    raise SystemExit(0)
-            print("[ERROR] No Nuitka blob found.", file=sys.stderr)
+        _filter = getattr(args, 'filter_str', None)
+
+        _blob = extract_pe_constants_blob(target)
+        if not _blob:
+            print(f"[ERROR] Could not find Nuitka constants blob in {target}", file=sys.stderr)
             raise SystemExit(1)
+
+        log(f"Blob: {len(_blob):,} bytes")
+
+        _bypass = CommercialBypass()
+        _is_enc = _bypass.is_blob_encrypted(_blob)
+
+        if _is_enc:
+            log_warn("Blob is encrypted — attempting commercial metadata normalization...")
+            try:
+                _pe_data = open(target, 'rb').read()
+            except OSError as _e:
+                log_err(f"Cannot read PE data: {_e}")
+                raise SystemExit(1)
+
+            import pefile as _pefile_lm
+            _pe_lm = _pefile_lm.PE(data=_pe_data)
+
+            # Fast path: scan .rdata only for mapping candidates, then derive
+            # d0-d7 directly from the encrypted blob digest (no PE disassembly).
+            log("  Scanning .rdata for mapping table...")
+            _mapping_cands = _bypass._find_all_mapping_candidates(_pe_lm, rdata_only=True)
+            if not _mapping_cands:
+                log("  No candidates in .rdata, scanning all sections...")
+                _mapping_cands = _bypass._find_all_mapping_candidates(_pe_lm)
+
+            _decrypted_blob = None
+            if _mapping_cands:
+                log(f"  {len(_mapping_cands)} mapping candidate(s) — deriving d0-d7 from blob...")
+                for _mi, _mc in enumerate(_mapping_cands):
+                    _derived_d = _bypass._derive_d_from_blob(_blob, _mc)
+                    if _derived_d:
+                        _result = _bypass._decrypt_raw(_blob, _mc, _derived_d)
+                        if _bypass._check_crc(_result):
+                            log_ok(f"  Decrypted! mapping#{_mi}  d0-d7={_derived_d}")
+                            _decrypted_blob = _result
+                            break
+
+            if _decrypted_blob is None:
+                # Slow fallback: full PE key-material scan + brute force
+                log_warn("  Fast derivation failed — running full key scan (may be slow)...")
+                _mapping_cands2, _d_cands = _bypass.extract_key_material_from_pe(_pe_data)
+                if _mapping_cands2 is not None:
+                    if not _d_cands:
+                        _d_cands = []
+                    if [0] * 8 not in _d_cands:
+                        _d_cands.append([0] * 8)
+                    _decrypted_blob, _, _ = _bypass.decrypt_blob_auto(
+                        _blob, _mapping_cands2, _d_cands
+                    )
+
+            if _decrypted_blob is not None:
+                _blob = _decrypted_blob
+                log_ok("Blob decrypted successfully")
+            else:
+                log_err("Could not recover key material — module names may be garbled")
+
+        _bypass_for_names = _bypass if _is_enc else None
+        _modules = parse_blob_modules(_blob, _bypass_for_names)
+
+        if not _modules:
+            print("[ERROR] Blob found but no modules parsed — format may be unsupported.",
+                  file=sys.stderr)
+            raise SystemExit(1)
+
+        if _filter:
+            _f = _filter.lower()
+            _modules = [(n, d) for n, d in _modules if _f in n.lower()]
+
+        print(f"\n  Target  : {os.path.basename(target)}")
+        print(f"  Edition : {'protected/commercial' if _is_enc else 'open-source'}")
+        print(f"  Modules : {len(_modules)}")
+        if _filter:
+            print(f"  Filter  : '{_filter}'")
+        print()
+        print(f"  {'#':<5}  {'MODULE NAME':<55}  {'SIZE':>9}  {'NOTE'}")
+        print("  " + "─" * 80)
+        for _i, (_n, _d) in enumerate(_modules, 1):
+            _note = ""
+            if _n == ".bytecode":
+                _note = "← .pyc bytecode chunk"
+            elif _n in ("__main__", "") or ("." not in _n and not _n.startswith("_")):
+                _note = "← likely main module"
+            print(f"  {_i:<5}  {_n:<55}  {len(_d)/1024:>7.1f} KB  {_note}")
+        print()
+        _sel = ",".join(n for n, _ in _modules if n != ".bytecode")
+        print("  ── Ready to use with --only: ──────────────────────────────────")
+        print(f"  python nuitka_decompiler.py {os.path.basename(target)} --only {_sel}")
+        print()
+        raise SystemExit(0)
 
     if _inject_only:
         # Skip all static analysis — go directly to runtime injection
