@@ -156,6 +156,8 @@ Previously `--list-modules` delegated to `list_modules.py`, which had no decrypt
 
 On `PROMAX.exe` (14.8 MB encrypted blob, 1287 modules): result goes from a hard error to a complete module listing in a few seconds.
 
+The same fast-path is now applied to **Phase 3 of the full pipeline** — previously Phase 3 always ran `_find_all_digest_candidates` (disassembly scan of `.text`) even when d0-d7 could be recovered instantly from the blob. Now Phase 3 derives d0-d7 from the blob first and falls back to the PE scan only if needed.
+
 ```bash
 # Now works on commercial builds too
 python nuitka_decompiler.py authorized_target.exe --list-modules

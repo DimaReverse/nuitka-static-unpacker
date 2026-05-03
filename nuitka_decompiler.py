@@ -9948,37 +9948,67 @@ class NuitkalizatorPro:
         if is_encrypted:
             log("Attempting protected metadata normalization...")
 
-            mapping_candidates, d_candidates = self.bypass.extract_key_material_from_pe(pe_data)
+            # Fast path: find mapping candidates then derive d0-d7 directly
+            # from the encrypted blob digest — no PE disassembly required.
+            import pefile as _pefile_p3
+            _pe_p3 = _pefile_p3.PE(data=pe_data)
+            mapping_candidates = self.bypass._find_all_mapping_candidates(_pe_p3, rdata_only=True)
+            if not mapping_candidates:
+                mapping_candidates = self.bypass._find_all_mapping_candidates(_pe_p3)
 
-            if mapping_candidates is not None:
-                log_ok(f"Found {len(mapping_candidates)} metadata table candidates and {len(d_candidates) if d_candidates else 0} digest candidates")
+            best_mapping = best_d = None
+            decrypted_blob = None
 
-                if d_candidates is None:
-                    d_candidates = []
-                if [0]*8 not in d_candidates:
-                    d_candidates.append([0]*8)
+            if mapping_candidates:
+                log(f"  {len(mapping_candidates)} _mapping[] candidate(s) to test")
+                for _mi, _mc in enumerate(mapping_candidates):
+                    _derived_d = self.bypass._derive_d_from_blob(blob_data, _mc)
+                    if _derived_d:
+                        _result = self.bypass._decrypt_raw(blob_data, _mc, _derived_d)
+                        if self.bypass._check_crc(_result):
+                            log_ok(f"Fast d0-d7 derivation succeeded (mapping#{_mi})")
+                            log_ok(f"  d0-d7 = {_derived_d}")
+                            decrypted_blob = _result
+                            best_mapping = _mc
+                            best_d = _derived_d
+                            break
 
-                blob_data, best_mapping, best_d = self.bypass.decrypt_blob_auto(
-                    blob_data, mapping_candidates, d_candidates
-                )
+            if decrypted_blob is None:
+                # Slow fallback: full PE key-material scan + brute force
+                log_warn("Fast derivation failed — running full key scan (may be slow)...")
+                mapping_candidates, d_candidates = self.bypass.extract_key_material_from_pe(pe_data)
 
+                if mapping_candidates is not None:
+                    log_ok(f"Found {len(mapping_candidates)} metadata table candidates and "
+                           f"{len(d_candidates) if d_candidates else 0} digest candidates")
+                    if d_candidates is None:
+                        d_candidates = []
+                    if [0] * 8 not in d_candidates:
+                        d_candidates.append([0] * 8)
+                    decrypted_blob, best_mapping, best_d = self.bypass.decrypt_blob_auto(
+                        blob_data, mapping_candidates, d_candidates
+                    )
+                else:
+                    log_err("Unable to normalize protected metadata for this binary")
+                    log_warn("Attempting parsing anyway (may fail)...")
+
+            if decrypted_blob is not None:
+                blob_data = decrypted_blob
                 dec_path = os.path.join(self.output_dir, "constants_blob_decrypted.bin")
                 with open(dec_path, 'wb') as f:
                     f.write(blob_data)
                 log_ok(f"Decrypted blob saved: {dec_path}")
 
-                key_info = {
-                    'mapping': list(best_mapping),
-                    'd_values': list(best_d),
-                    'mapping_candidates_count': len(mapping_candidates),
-                    'd_candidates_count': len(d_candidates),
-                }
-                key_path = os.path.join(self.output_dir, "extracted_key.json")
-                with open(key_path, 'w') as f:
-                    json.dump(key_info, f, indent=2)
-            else:
-                log_err("Unable to normalize protected metadata for this binary")
-                log_warn("Attempting parsing anyway (may fail)...")
+                if best_mapping is not None and best_d is not None:
+                    key_info = {
+                        'mapping': list(best_mapping),
+                        'd_values': list(best_d),
+                        'mapping_candidates_count': len(mapping_candidates),
+                        'd_candidates_count': 0,
+                    }
+                    key_path = os.path.join(self.output_dir, "extracted_key.json")
+                    with open(key_path, 'w') as f:
+                        json.dump(key_info, f, indent=2)
         else:
             log_ok("Blob uses a plain metadata layout")
 
