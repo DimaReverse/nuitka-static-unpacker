@@ -2681,38 +2681,65 @@ class NuitkaModuleTableParser:
         64: 'EXCLUDED',
     }
 
-    def __init__(self, pe):
+    def __init__(self, pe, name_decode_table=None):
         self.pe = pe
         self.image_base = pe.OPTIONAL_HEADER.ImageBase
         self.is_x64 = pe.FILE_HEADER.Machine == 0x8664
         self.ptr_size = 8 if self.is_x64 else 4
         self.record_size = 32 if self.is_x64 else 20
+        # Optional: mapping2 decode table for commercial builds where module
+        # name strings in the PE are encoded (name_decode_table[enc] = orig).
+        self.name_decode_table = name_decode_table
 
     def _collect_strings(self):
-        """Index every null-terminated printable ASCII string in .rdata/.data."""
+        """Index every null-terminated printable ASCII string in .rdata/.data.
+
+        For commercial builds pass name_decode_table to also find encoded
+        module name strings (encoded with Nuitka Commercial mapping2).
+        """
         strings_by_va = {}
+        dec = self.name_decode_table  # None for open-source builds
+
         for section in self.pe.sections:
-            name = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
-            if name not in ('.rdata', '.data'):
+            sec_name = section.Name.rstrip(b'\x00').decode('ascii', errors='replace')
+            if sec_name not in ('.rdata', '.data'):
                 continue
             sec_data = section.get_data()
             base_va = self.image_base + section.VirtualAddress
-            i = 0
             sz = len(sec_data)
+            i = 0
             while i < sz:
+                # ── Pass A: plain printable ASCII ──
                 j = i
                 while j < sz and 0x20 <= sec_data[j] < 0x7F:
                     j += 1
-                if j > i and j < sz and sec_data[j] == 0:
-                    if j - i >= 2:
+                if j > i and j < sz and sec_data[j] == 0 and j - i >= 2:
+                    try:
+                        s = sec_data[i:j].decode('ascii')
+                        strings_by_va[base_va + i] = s
+                    except Exception:
+                        pass
+
+                # ── Pass B: mapping2-decoded (commercial builds only) ──
+                if dec is not None and sec_data[i] != 0:
+                    k = i
+                    decoded_bytes = []
+                    while k < sz and sec_data[k] != 0 and len(decoded_bytes) < 256:
+                        orig = dec[sec_data[k]]
+                        if not (0x20 <= orig < 0x7F):
+                            break
+                        decoded_bytes.append(orig)
+                        k += 1
+                    if (len(decoded_bytes) >= 2 and k < sz and sec_data[k] == 0
+                            and (base_va + i) not in strings_by_va):
                         try:
-                            s = sec_data[i:j].decode('ascii')
-                            strings_by_va[base_va + i] = s
+                            s = bytes(decoded_bytes).decode('ascii')
+                            if self._is_module_name(s) or s in ('.bytecode', ''):
+                                strings_by_va[base_va + i] = s
                         except Exception:
                             pass
-                    i = j + 1
-                else:
-                    i = j + 1 if j > i else i + 1
+
+                i = j + 1 if j > i else i + 1
         return strings_by_va
 
     @staticmethod
@@ -10076,7 +10103,8 @@ class NuitkalizatorPro:
         try:
             import pefile as _pefile_mt
             _pe_mt = _pefile_mt.PE(data=pe_data)
-            mtp = NuitkaModuleTableParser(_pe_mt)
+            _name_dec = self.bypass.name_decode_table if is_encrypted else None
+            mtp = NuitkaModuleTableParser(_pe_mt, name_decode_table=_name_dec)
             # Feed in every module name the blob decoder already resolved
             # (plus __main__ / __init__ / .bytecode sentinels). The pass-3
             # name-anchored fallback inside find_table() uses these to rescue
